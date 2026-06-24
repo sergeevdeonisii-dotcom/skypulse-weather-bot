@@ -22,10 +22,15 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ""
 const PORT = Number(process.env.PORT || 0);
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const WEBHOOK_PATH = `/telegram${WEBHOOK_SECRET ? `/${WEBHOOK_SECRET}` : ""}`;
+const MAX_MESSAGE_TEXT_LENGTH = 160;
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX_MESSAGES = 18;
+const RATE_LIMIT_MAX_CALLBACKS = 40;
 
 const userSessions = new Map();
 const userLanguages = new Map();
 const lastClothingAdvice = new Map();
+const rateBuckets = new Map();
 const transportCache = {
   routes: { value: null, expiresAt: 0 },
   stops: { value: null, expiresAt: 0 },
@@ -42,6 +47,37 @@ process.on("unhandledRejection", (error) => {
 process.on("uncaughtException", (error) => {
   console.error("Uncaught exception:", error?.message || error);
 });
+
+function securityHeaders(contentType = "text/plain; charset=utf-8") {
+  return {
+    "Content-Type": contentType,
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store"
+  };
+}
+
+function isRateLimited(chatId, kind = "message") {
+  const now = Date.now();
+  const key = `${chatId}:${kind}`;
+  const limit = kind === "callback" ? RATE_LIMIT_MAX_CALLBACKS : RATE_LIMIT_MAX_MESSAGES;
+  const bucket = rateBuckets.get(key) || [];
+  const fresh = bucket.filter((time) => now - time < RATE_LIMIT_WINDOW_MS);
+  fresh.push(now);
+  rateBuckets.set(key, fresh);
+  return fresh.length > limit;
+}
+
+function cleanupCallbackStore() {
+  const now = Date.now();
+  for (const [token, payload] of callbackStore.entries()) {
+    if (!payload || payload.expiresAt < now) callbackStore.delete(token);
+  }
+}
+
+function isTextTooLong(text) {
+  return text.length > MAX_MESSAGE_TEXT_LENGTH;
+}
 
 const LABELS = {
   ru: {
@@ -363,6 +399,10 @@ function formatCityName(city) {
   return [city.name, city.admin1, city.country].filter(Boolean).join(", ");
 }
 
+function formatSafeCityName(city) {
+  return escapeHtml(formatCityName(city));
+}
+
 function dayLabel(day, lang) {
   if (lang === "en") return day === "tomorrow" ? "tomorrow" : "today";
   return day === "tomorrow" ? "завтра" : "сегодня";
@@ -430,7 +470,7 @@ function formatDailyWeather(city, weather, day, lang) {
 
   if (lang === "en") {
     return [
-      `<b>${formatCityName(city)}</b>`,
+      `<b>${formatSafeCityName(city)}</b>`,
       `Forecast for ${dayLabel(day, lang)} (${date})`,
       "",
       `Overall: ${description}`,
@@ -442,7 +482,7 @@ function formatDailyWeather(city, weather, day, lang) {
   }
 
   return [
-    `<b>${formatCityName(city)}</b>`,
+    `<b>${formatSafeCityName(city)}</b>`,
     `Прогноз на ${dayLabel(day, lang)} (${date})`,
     "",
     `День в целом: ${description}`,
@@ -455,14 +495,14 @@ function formatDailyWeather(city, weather, day, lang) {
 
 function formatCurrentWeather(city, weather, lang, observedCurrent = null) {
   const current = observedCurrent || weather.current;
-  const description = observedCurrent?.description || describeWeatherCode(current.weather_code, lang);
+  const description = escapeHtml(observedCurrent?.description || describeWeatherCode(current.weather_code, lang));
   const sourceLine = observedCurrent
     ? (lang === "en" ? "Source: current observation" : "Источник: текущее наблюдение")
     : (lang === "en" ? "Source: forecast model" : "Источник: прогнозная модель");
 
   if (lang === "en") {
     return [
-      `<b>${formatCityName(city)}</b>`,
+      `<b>${formatSafeCityName(city)}</b>`,
       "Weather now",
       "",
       `${Math.round(current.temperature_2m)}°C, ${description}`,
@@ -475,7 +515,7 @@ function formatCurrentWeather(city, weather, lang, observedCurrent = null) {
   }
 
   return [
-    `<b>${formatCityName(city)}</b>`,
+    `<b>${formatSafeCityName(city)}</b>`,
     "Погода сейчас",
     "",
     `${Math.round(current.temperature_2m)}°C, ${description}`,
@@ -501,7 +541,7 @@ function formatHourlyWeather(city, weather, day, hour, lang) {
 
   if (lang === "en") {
     return [
-      `<b>${formatCityName(city)}</b>`,
+      `<b>${formatSafeCityName(city)}</b>`,
       `Forecast for ${dayLabel(day, lang)} (${date}) at ${String(hour).padStart(2, "0")}:00`,
       "",
       `${Math.round(weather.hourly.temperature_2m[index])}°C, ${description}`,
@@ -514,7 +554,7 @@ function formatHourlyWeather(city, weather, day, hour, lang) {
   }
 
   return [
-    `<b>${formatCityName(city)}</b>`,
+    `<b>${formatSafeCityName(city)}</b>`,
     `Прогноз на ${dayLabel(day, lang)} (${date}) в ${String(hour).padStart(2, "0")}:00`,
     "",
     `${Math.round(weather.hourly.temperature_2m[index])}°C, ${description}`,
@@ -843,6 +883,7 @@ function btransSlugForType(type) {
 }
 
 function makeCallbackToken(payload) {
+  if (callbackStore.size > 500) cleanupCallbackStore();
   const token = Math.random().toString(36).slice(2, 10);
   callbackStore.set(token, { ...payload, expiresAt: Date.now() + 30 * 60 * 1000 });
   return token;
@@ -1417,6 +1458,14 @@ async function handleCallbackQuery(callbackQuery) {
   const chatId = callbackQuery.message?.chat?.id;
   if (!chatId) return;
 
+  if (isRateLimited(chatId, "callback")) {
+    await telegram("answerCallbackQuery", {
+      callback_query_id: callbackQuery.id,
+      text: langOf(chatId) === "en" ? "Too many clicks. Wait a bit." : "Слишком много нажатий. Подожди чуть-чуть."
+    });
+    return;
+  }
+
   await telegram("answerCallbackQuery", { callback_query_id: callbackQuery.id });
 
   if (data.startsWith("lang:")) {
@@ -1599,6 +1648,20 @@ async function handleMessage(message) {
 
   const lang = langOf(chatId);
 
+  if (isRateLimited(chatId, "message")) {
+    await sendMessage(chatId, lang === "en"
+      ? "Too many messages. Please wait a minute."
+      : "Слишком много сообщений. Подожди минуту.");
+    return;
+  }
+
+  if (isTextTooLong(text)) {
+    await sendMessage(chatId, lang === "en"
+      ? "Message is too long. Send a city or stop name up to 160 characters."
+      : "Сообщение слишком длинное. Напиши город или остановку до 160 символов.");
+    return;
+  }
+
   if (text === "/start") {
     resetToMenu(chatId);
     await sendLanguageChoice(chatId);
@@ -1647,10 +1710,14 @@ async function poll() {
 }
 
 async function handleUpdate(update) {
-  if (update.callback_query) {
-    await handleCallbackQuery(update.callback_query);
-  } else if (update.message) {
-    await handleMessage(update.message);
+  try {
+    if (update.callback_query) {
+      await handleCallbackQuery(update.callback_query);
+    } else if (update.message) {
+      await handleMessage(update.message);
+    }
+  } catch (error) {
+    console.error("Update handling error:", error.message);
   }
 }
 
@@ -1669,7 +1736,7 @@ async function configureWebhook(baseUrl) {
     allowed_updates: ["message", "callback_query"],
     secret_token: WEBHOOK_SECRET || undefined
   });
-  console.log(`Telegram webhook set: ${webhookUrl}`);
+  console.log(`Telegram webhook set for host: ${new URL(webhookUrl).host}`);
 }
 
 function readRequestBody(req, maxBytes = 1024 * 1024) {
@@ -1695,34 +1762,42 @@ function startWebhookServer() {
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === "GET" && (req.url === "/" || req.url === "/healthz")) {
-        res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+        res.writeHead(200, securityHeaders());
         res.end("ok");
         return;
       }
 
       if (req.method === "POST" && req.url === WEBHOOK_PATH) {
         if (WEBHOOK_SECRET && req.headers["x-telegram-bot-api-secret-token"] !== WEBHOOK_SECRET) {
-          res.writeHead(403);
+          res.writeHead(403, securityHeaders());
           res.end("forbidden");
           return;
         }
 
-        const body = await readRequestBody(req);
-        res.writeHead(200, { "Content-Type": "application/json" });
+        const body = await readRequestBody(req, 256 * 1024);
+        let update;
+        try {
+          update = JSON.parse(body);
+        } catch {
+          res.writeHead(400, securityHeaders());
+          res.end("bad json");
+          return;
+        }
+
+        res.writeHead(200, securityHeaders("application/json; charset=utf-8"));
         res.end(JSON.stringify({ ok: true }));
 
-        const update = JSON.parse(body);
         handleUpdate(update).catch((error) => {
           console.error("Webhook update error:", error.message);
         });
         return;
       }
 
-      res.writeHead(404);
+      res.writeHead(404, securityHeaders());
       res.end("not found");
     } catch (error) {
       console.error("Webhook request error:", error.message);
-      if (!res.headersSent) res.writeHead(500);
+      if (!res.headersSent) res.writeHead(500, securityHeaders());
       res.end("error");
     }
   });
