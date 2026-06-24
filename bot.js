@@ -3,6 +3,7 @@ const http = require("http");
 const https = require("https");
 const path = require("path");
 const zlib = require("zlib");
+const crypto = require("crypto");
 
 const envPath = path.join(__dirname, ".env");
 if (fs.existsSync(envPath)) {
@@ -26,6 +27,12 @@ const MAX_MESSAGE_TEXT_LENGTH = 160;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_MESSAGES = 18;
 const RATE_LIMIT_MAX_CALLBACKS = 40;
+const MAX_EXTERNAL_RESPONSE_BYTES = 2 * 1024 * 1024;
+const CALLBACK_TOKEN_TTL_MS = 30 * 60 * 1000;
+const MAX_CALLBACK_TOKENS = 500;
+const SESSION_TTL_MS = 30 * 60 * 1000;
+const ADVICE_TTL_MS = 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 
 const userSessions = new Map();
 const userLanguages = new Map();
@@ -39,6 +46,7 @@ const transportCache = {
 };
 const callbackStore = new Map();
 let offset = 0;
+let lastStateCleanupAt = 0;
 
 process.on("unhandledRejection", (error) => {
   console.error("Unhandled rejection:", error?.message || error);
@@ -53,12 +61,14 @@ function securityHeaders(contentType = "text/plain; charset=utf-8") {
     "Content-Type": contentType,
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "Cache-Control": "no-store"
   };
 }
 
 function isRateLimited(chatId, kind = "message") {
   const now = Date.now();
+  cleanupRuntimeState(now);
   const key = `${chatId}:${kind}`;
   const limit = kind === "callback" ? RATE_LIMIT_MAX_CALLBACKS : RATE_LIMIT_MAX_MESSAGES;
   const bucket = rateBuckets.get(key) || [];
@@ -72,6 +82,42 @@ function cleanupCallbackStore() {
   const now = Date.now();
   for (const [token, payload] of callbackStore.entries()) {
     if (!payload || payload.expiresAt < now) callbackStore.delete(token);
+  }
+}
+
+function cleanupRuntimeState(now = Date.now()) {
+  if (now - lastStateCleanupAt < CLEANUP_INTERVAL_MS) return;
+  lastStateCleanupAt = now;
+
+  for (const [key, bucket] of rateBuckets.entries()) {
+    const fresh = bucket.filter((time) => now - time < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length) {
+      rateBuckets.set(key, fresh);
+    } else {
+      rateBuckets.delete(key);
+    }
+  }
+
+  cleanupCallbackStore();
+
+  for (const [chatId, session] of userSessions.entries()) {
+    if (!session?.updatedAt || now - session.updatedAt > SESSION_TTL_MS) {
+      userSessions.delete(chatId);
+    }
+  }
+
+  for (const [chatId, cached] of lastClothingAdvice.entries()) {
+    if (!cached?.expiresAt || cached.expiresAt < now) {
+      lastClothingAdvice.delete(chatId);
+    }
+  }
+
+  for (const [key, cached] of transportCache.routePages.entries()) {
+    if (!cached?.expiresAt || cached.expiresAt < now) transportCache.routePages.delete(key);
+  }
+
+  for (const [key, cached] of transportCache.stopPages.entries()) {
+    if (!cached?.expiresAt || cached.expiresAt < now) transportCache.stopPages.delete(key);
   }
 }
 
@@ -301,14 +347,88 @@ function helpText(lang) {
   ].join("\n");
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("External request timeout");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readLimitedFetchText(response, maxBytes = MAX_EXTERNAL_RESPONSE_BYTES) {
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error("External response too large");
+  }
+
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > maxBytes) {
+      throw new Error("External response too large");
+    }
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error("External response too large");
+    }
+    chunks.push(Buffer.from(value));
+  }
+
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function fetchJson(url, {
+  timeoutMs = 9000,
+  maxBytes = MAX_EXTERNAL_RESPONSE_BYTES,
+  headers = {},
+  label = "External API"
+} = {}) {
+  const response = await fetchWithTimeout(url, { headers }, timeoutMs);
+  if (!response.ok) throw new Error(`${label} request failed`);
+
+  const text = await readLimitedFetchText(response, maxBytes);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${label} returned invalid JSON`);
+  }
+}
+
 async function telegram(method, payload) {
-  const response = await fetch(`${TELEGRAM_API}/${method}`, {
+  const response = await fetchWithTimeout(`${TELEGRAM_API}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  });
+  }, method === "getUpdates" ? 35000 : 10000);
 
-  const data = await response.json();
+  const text = await readLimitedFetchText(response, 256 * 1024);
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Telegram returned invalid JSON: ${method}`);
+  }
+  if (!response.ok) {
+    throw new Error(data.description || `Telegram HTTP ${response.status}: ${method}`);
+  }
   if (!data.ok) {
     throw new Error(data.description || `Telegram API error: ${method}`);
   }
@@ -347,9 +467,11 @@ async function findCity(query, lang) {
   url.searchParams.set("language", lang);
   url.searchParams.set("format", "json");
 
-  const response = await fetch(url);
-  if (!response.ok) throw new Error("Geocoding request failed");
-  const data = await response.json();
+  const data = await fetchJson(url, {
+    timeoutMs: 8000,
+    maxBytes: 256 * 1024,
+    label: "Geocoding"
+  });
   return data.results?.[0] || null;
 }
 
@@ -363,21 +485,23 @@ async function getWeather(city) {
   url.searchParams.set("daily", "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code");
   url.searchParams.set("forecast_days", "2");
 
-  const response = await fetch(url);
-  if (!response.ok) throw new Error("Weather request failed");
-  return response.json();
+  return fetchJson(url, {
+    timeoutMs: 9000,
+    maxBytes: 512 * 1024,
+    label: "Weather"
+  });
 }
 
 async function getObservedCurrent(city) {
   const url = new URL(`https://wttr.in/${city.latitude},${city.longitude}`);
   url.searchParams.set("format", "j1");
 
-  const response = await fetch(url, {
-    headers: { "User-Agent": "SkyPulseWeatherBot/1.0" }
+  const data = await fetchJson(url, {
+    timeoutMs: 8000,
+    maxBytes: 512 * 1024,
+    headers: { "User-Agent": "SkyPulseWeatherBot/1.0" },
+    label: "Observed weather"
   });
-  if (!response.ok) return null;
-
-  const data = await response.json();
   const current = data.current_condition?.[0];
   if (!current) return null;
 
@@ -668,11 +792,12 @@ function formatClothingAdvice(context) {
   const description = describeWeatherCode(context.code, lang);
   const base = getBaseClothing(apparent, lang);
   const shoe = getShoeAdvice(apparent, precipitation, context.code, lang);
+  const safeContextLabel = `${escapeHtml(context.city)}, ${escapeHtml(context.label)}`;
 
   if (lang === "en") {
     const lines = [
       "<b>What should I wear?</b>",
-      `${context.city}, ${context.label}`,
+      safeContextLabel,
       "",
       `1. Base: ${base}.`,
       `2. Feels like: around ${apparent}°C${temp !== apparent ? `, actual ${temp}°C` : ""}.`,
@@ -700,7 +825,7 @@ function formatClothingAdvice(context) {
 
   const lines = [
     "<b>А что по одежде?</b>",
-    `${context.city}, ${context.label}`,
+    safeContextLabel,
     "",
     `1. База: ${base}.`,
     `2. По ощущениям: около ${apparent}°C${temp !== apparent ? `, фактически ${temp}°C` : ""}.`,
@@ -779,10 +904,11 @@ function parseJsonArrayLenient(text) {
   }
 }
 
-function fetchPartialText(url, timeoutMs = 9000) {
+function fetchPartialText(url, timeoutMs = 9000, maxBytes = MAX_EXTERNAL_RESPONSE_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let settled = false;
+    let total = 0;
 
     const finish = (error = null) => {
       if (settled) return;
@@ -794,13 +920,27 @@ function fetchPartialText(url, timeoutMs = 9000) {
       resolve(Buffer.concat(chunks).toString("utf8"));
     };
 
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+
     const req = https.get(url, {
       headers: {
         Referer: "https://bus62.ru/grodno/",
         "User-Agent": "SkyPulseWeatherBot/1.0"
       }
     }, (res) => {
-      res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      res.on("data", (chunk) => {
+        total += chunk.length;
+        if (total > maxBytes) {
+          req.destroy();
+          fail(new Error("Transport response too large"));
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+      });
       res.on("end", () => finish());
       res.on("error", finish);
     });
@@ -813,8 +953,22 @@ function fetchPartialText(url, timeoutMs = 9000) {
   });
 }
 
-function fetchText(url, timeoutMs = 12000) {
+function fetchText(url, timeoutMs = 12000, maxBytes = MAX_EXTERNAL_RESPONSE_BYTES) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+
+    const succeed = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
     const req = https.get(url, {
       headers: {
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -823,20 +977,34 @@ function fetchText(url, timeoutMs = 12000) {
       }
     }, (res) => {
       const chunks = [];
-      res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      let total = 0;
+      res.on("data", (chunk) => {
+        total += chunk.length;
+        if (total > maxBytes) {
+          req.destroy();
+          fail(new Error("BTrans response too large"));
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+      });
       res.on("end", () => {
+        if (settled) return;
         if (res.statusCode && res.statusCode >= 400) {
-          reject(new Error(`BTrans HTTP ${res.statusCode}`));
+          fail(new Error(`BTrans HTTP ${res.statusCode}`));
           return;
         }
         const buffer = Buffer.concat(chunks);
         const encoding = String(res.headers["content-encoding"] || "").toLowerCase();
         const done = (error, decoded) => {
           if (error) {
-            reject(error);
+            fail(error);
             return;
           }
-          resolve(decoded.toString("utf8"));
+          if (decoded.length > maxBytes) {
+            fail(new Error("BTrans decoded response too large"));
+            return;
+          }
+          succeed(decoded.toString("utf8"));
         };
 
         if (encoding.includes("br")) {
@@ -846,13 +1014,13 @@ function fetchText(url, timeoutMs = 12000) {
         } else if (encoding.includes("deflate")) {
           zlib.inflate(buffer, done);
         } else {
-          resolve(buffer.toString("utf8"));
+          succeed(buffer.toString("utf8"));
         }
       });
-      res.on("error", reject);
+      res.on("error", fail);
     });
 
-    req.on("error", reject);
+    req.on("error", fail);
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error("BTrans request timeout"));
     });
@@ -883,18 +1051,25 @@ function btransSlugForType(type) {
 }
 
 function makeCallbackToken(payload) {
-  if (callbackStore.size > 500) cleanupCallbackStore();
-  const token = Math.random().toString(36).slice(2, 10);
-  callbackStore.set(token, { ...payload, expiresAt: Date.now() + 30 * 60 * 1000 });
+  cleanupCallbackStore();
+  while (callbackStore.size >= MAX_CALLBACK_TOKENS) {
+    const oldestToken = callbackStore.keys().next().value;
+    if (!oldestToken) break;
+    callbackStore.delete(oldestToken);
+  }
+
+  const token = crypto.randomBytes(16).toString("hex");
+  callbackStore.set(token, { ...payload, expiresAt: Date.now() + CALLBACK_TOKEN_TTL_MS });
   return token;
 }
 
-function getCallbackPayload(token) {
+function getCallbackPayload(token, chatId) {
   const payload = callbackStore.get(token);
   if (!payload || payload.expiresAt < Date.now()) {
     callbackStore.delete(token);
     return null;
   }
+  if (payload.chatId && payload.chatId !== String(chatId)) return null;
   return payload;
 }
 
@@ -1030,11 +1205,12 @@ function routeDetailKeyboard(routeDirections, lang) {
   return { inline_keyboard: rows };
 }
 
-function btransStopsKeyboard(route, directionIndex, lang) {
+function btransStopsKeyboard(route, directionIndex, lang, chatId) {
   const direction = route.directions[directionIndex];
   const rows = direction.stops.map((stop, index) => {
     const token = makeCallbackToken({
       kind: "btrans_stop",
+      chatId: String(chatId),
       url: stop.url,
       routeType: route.type,
       routeNum: route.num,
@@ -1195,7 +1371,7 @@ async function showTransportMenu(chatId) {
 
 async function askForStopSearch(chatId) {
   const lang = langOf(chatId);
-  userSessions.set(chatId, { step: "transport_stop_search" });
+  userSessions.set(chatId, { step: "transport_stop_search", updatedAt: Date.now() });
   await sendMessage(chatId, lang === "en"
     ? "Type a stop name, for example: Автовокзал or Вишневец."
     : "Напиши название остановки, например: Автовокзал или Вишневец.");
@@ -1299,7 +1475,7 @@ async function showRouteDetails(chatId, type, num) {
 
     for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
       await sendMessage(chatId, chunks[chunkIndex], chunkIndex === chunks.length - 1
-        ? { reply_markup: btransStopsKeyboard(routePage, index, lang) }
+        ? { reply_markup: btransStopsKeyboard(routePage, index, lang, chatId) }
         : {});
     }
   }
@@ -1356,7 +1532,12 @@ async function sendWeather(chatId, cityQuery, day = "today", timeChoice = { type
     adviceContext = buildHourlyAdviceContext(city, weather, day, timeChoice.hour, lang);
   }
 
-  if (adviceContext) lastClothingAdvice.set(chatId, adviceContext);
+  if (adviceContext) {
+    lastClothingAdvice.set(chatId, {
+      context: adviceContext,
+      expiresAt: Date.now() + ADVICE_TTL_MS
+    });
+  }
   await sendMessage(chatId, message, { reply_markup: weatherResultKeyboard(lang) });
 }
 
@@ -1372,7 +1553,7 @@ function resetToMenu(chatId) {
 }
 
 function startFlow(chatId, day = null) {
-  const session = { step: day ? "city" : "day", day, city: null };
+  const session = { step: day ? "city" : "day", day, city: null, updatedAt: Date.now() };
   userSessions.set(chatId, session);
   return session;
 }
@@ -1418,6 +1599,7 @@ async function askForTime(chatId, day, city) {
 
 async function handleSession(chatId, text, session) {
   const lang = langOf(chatId);
+  session.updatedAt = Date.now();
 
   if (session.step === "transport_stop_search") {
     resetToMenu(chatId);
@@ -1563,7 +1745,7 @@ async function handleCallbackQuery(callbackQuery) {
 
   if (data.startsWith("tr:btstop:")) {
     const token = data.slice("tr:btstop:".length);
-    const payload = getCallbackPayload(token);
+    const payload = getCallbackPayload(token, chatId);
     if (!payload || payload.kind !== "btrans_stop") {
       await sendMessage(chatId, lang === "en"
         ? "This stop button expired. Open the route again."
@@ -1626,7 +1808,9 @@ async function handleCallbackQuery(callbackQuery) {
   }
 
   if (data === "clothing") {
-    const adviceContext = lastClothingAdvice.get(chatId);
+    const cachedAdvice = lastClothingAdvice.get(chatId);
+    const adviceContext = cachedAdvice?.expiresAt > Date.now() ? cachedAdvice.context : null;
+    if (!adviceContext) lastClothingAdvice.delete(chatId);
     if (!adviceContext) {
       const message = lang === "en"
         ? "Ask for a forecast first, then I can suggest what to wear."
@@ -1774,7 +1958,22 @@ function startWebhookServer() {
           return;
         }
 
-        const body = await readRequestBody(req, 256 * 1024);
+        const contentType = String(req.headers["content-type"] || "").toLowerCase();
+        if (!contentType.includes("application/json")) {
+          res.writeHead(415, securityHeaders());
+          res.end("unsupported media type");
+          return;
+        }
+
+        let body;
+        try {
+          body = await readRequestBody(req, 256 * 1024);
+        } catch (error) {
+          const isTooLarge = error?.message === "Request body too large";
+          res.writeHead(isTooLarge ? 413 : 400, securityHeaders());
+          res.end(isTooLarge ? "request too large" : "bad request");
+          return;
+        }
         let update;
         try {
           update = JSON.parse(body);
@@ -1818,6 +2017,11 @@ function startWebhookServer() {
 
 if (!BOT_TOKEN) {
   console.error("BOT_TOKEN is missing. Create .env from .env.example and paste BotFather token.");
+  process.exit(1);
+}
+
+if (PORT && !WEBHOOK_SECRET) {
+  console.error("WEBHOOK_SECRET is missing. Refusing to start webhook mode without Telegram secret protection.");
   process.exit(1);
 }
 
