@@ -485,11 +485,12 @@ function savedCityLabel(city) {
 function informationKeyboard(chatId, lang) {
   const preferences = preferencesOf(chatId);
   const cityLabel = savedCityLabel(preferences.city);
+  const cityButtonLabel = cityLabel.length > 42 ? `${cityLabel.slice(0, 41)}…` : cityLabel;
   return {
     inline_keyboard: [
       [{
-        text: cityLabel
-          ? (lang === "en" ? `🏙️ My city: ${cityLabel}` : `🏙️ Мой город: ${cityLabel}`)
+        text: cityButtonLabel
+          ? (lang === "en" ? `🏙️ My city: ${cityButtonLabel}` : `🏙️ Мой город: ${cityButtonLabel}`)
           : (lang === "en" ? "🏙️ Set my city" : "🏙️ Указать мой город"),
         callback_data: "info:city"
       }],
