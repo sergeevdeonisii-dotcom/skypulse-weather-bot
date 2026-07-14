@@ -492,7 +492,7 @@ function informationKeyboard(chatId, lang) {
         text: cityButtonLabel
           ? (lang === "en" ? `🏙️ My city: ${cityButtonLabel}` : `🏙️ Мой город: ${cityButtonLabel}`)
           : (lang === "en" ? "🏙️ Set my city" : "🏙️ Указать мой город"),
-        callback_data: "info:city"
+        callback_data: cityLabel ? "info:city" : "info:city_set"
       }],
       [{
         text: lang === "en"
@@ -2048,9 +2048,26 @@ async function handleSession(chatId, text, session) {
   }
 
   if (session.step === "city") {
-    session.city = text;
+    let city;
+    try {
+      city = await findCity(text, lang);
+    } catch (error) {
+      console.error("Weather city lookup error:", error.message);
+      await sendMessage(chatId, lang === "en"
+        ? "City search is temporarily unavailable. Try again in a minute."
+        : "Поиск города временно недоступен. Попробуй ещё раз через минуту.");
+      return;
+    }
+    if (!city) {
+      await sendMessage(chatId, lang === "en"
+        ? `I could not find "${escapeHtml(text)}". Type the city name more precisely.`
+        : `Не нашёл город «${escapeHtml(text)}». Напиши название точнее.`);
+      return;
+    }
+    setSavedCity(chatId, city);
+    session.city = city;
     session.step = "time";
-    await askForTime(chatId, session.day, session.city);
+    await askForTime(chatId, session.day, formatCityName(city));
     return;
   }
 
