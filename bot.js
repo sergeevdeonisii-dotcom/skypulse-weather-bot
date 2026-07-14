@@ -11,7 +11,8 @@ if (fs.existsSync(envPath)) {
   for (const line of envText.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) continue;
-    const [key, ...valueParts] = trimmed.split("=");
+    const [rawKey, ...valueParts] = trimmed.split("=");
+    const key = rawKey.replace(/^\uFEFF/, "");
     if (!process.env[key]) {
       process.env[key] = valueParts.join("=").trim();
     }
@@ -41,6 +42,7 @@ const rateBuckets = new Map();
 const transportCache = {
   routes: { value: null, expiresAt: 0 },
   stops: { value: null, expiresAt: 0 },
+  routeLists: new Map(),
   routePages: new Map(),
   stopPages: new Map()
 };
@@ -116,6 +118,10 @@ function cleanupRuntimeState(now = Date.now()) {
     if (!cached?.expiresAt || cached.expiresAt < now) transportCache.routePages.delete(key);
   }
 
+  for (const [key, cached] of transportCache.routeLists.entries()) {
+    if (!cached?.expiresAt || cached.expiresAt < now) transportCache.routeLists.delete(key);
+  }
+
   for (const [key, cached] of transportCache.stopPages.entries()) {
     if (!cached?.expiresAt || cached.expiresAt < now) transportCache.stopPages.delete(key);
   }
@@ -127,32 +133,32 @@ function isTextTooLong(text) {
 
 const LABELS = {
   ru: {
-    today: "Погода сегодня",
-    tomorrow: "Погода завтра",
-    help: "Помощь",
-    clothing: "А что по одежде?",
-    now: "Сейчас",
-    morning: "Утро 09:00",
-    day: "День 15:00",
-    evening: "Вечер 18:00",
-    night: "Ночь 21:00",
-    allDay: "Весь день",
-    menu: "Меню",
-    language: "Язык"
+    today: "🌤️ Погода сегодня",
+    tomorrow: "🌦️ Погода завтра",
+    help: "❓ Помощь",
+    clothing: "🧥 А что по одежде?",
+    now: "🌡️ Сейчас",
+    morning: "🌅 Утро 09:00",
+    day: "☀️ День 15:00",
+    evening: "🌇 Вечер 18:00",
+    night: "🌙 Ночь 21:00",
+    allDay: "🕘 Весь день",
+    menu: "🏠 Меню",
+    language: "🌐 Язык"
   },
   en: {
-    today: "Weather today",
-    tomorrow: "Weather tomorrow",
-    help: "Help",
-    clothing: "What should I wear?",
-    now: "Now",
-    morning: "Morning 09:00",
-    day: "Afternoon 15:00",
-    evening: "Evening 18:00",
-    night: "Night 21:00",
-    allDay: "All day",
-    menu: "Menu",
-    language: "Language"
+    today: "🌤️ Weather today",
+    tomorrow: "🌦️ Weather tomorrow",
+    help: "❓ Help",
+    clothing: "🧥 What should I wear?",
+    now: "🌡️ Now",
+    morning: "🌅 Morning 09:00",
+    day: "☀️ Afternoon 15:00",
+    evening: "🌇 Evening 18:00",
+    night: "🌙 Night 21:00",
+    allDay: "🕘 All day",
+    menu: "🏠 Menu",
+    language: "🌐 Language"
   }
 };
 
@@ -212,8 +218,8 @@ function langOf(chatId) {
 function languageKeyboard() {
   return {
     inline_keyboard: [[
-      { text: "Русский", callback_data: "lang:ru" },
-      { text: "English", callback_data: "lang:en" }
+      { text: "🇷🇺 Русский", callback_data: "lang:ru" },
+      { text: "🇬🇧 English", callback_data: "lang:en" }
     ]]
   };
 }
@@ -222,8 +228,8 @@ function menuKeyboard(lang) {
   return {
     inline_keyboard: [
       [
-        { text: lang === "en" ? "Weather" : "Погода", callback_data: "weather_menu" },
-        { text: lang === "en" ? "Transport" : "Транспорт", callback_data: "transport_menu" }
+        { text: lang === "en" ? "🌤️ Weather" : "🌤️ Погода", callback_data: "weather_menu" },
+        { text: lang === "en" ? "🚌 Transport" : "🚌 Транспорт", callback_data: "transport_menu" }
       ],
       [
         { text: LABELS[lang].help, callback_data: "help" },
@@ -249,23 +255,24 @@ function weatherMenuKeyboard(lang) {
 function transportMenuKeyboard(lang) {
   return {
     inline_keyboard: [
-      [{ text: lang === "en" ? "Find stop" : "Найти остановку", callback_data: "tr:stop_search" }],
+      [{ text: lang === "en" ? "🚏 Find a stop" : "🚏 Найти остановку", callback_data: "tr:stop_search" }],
       [
-        { text: lang === "en" ? "Buses" : "Автобусы", callback_data: "tr:type:A" },
-        { text: lang === "en" ? "Trolleybuses" : "Троллейбусы", callback_data: "tr:type:Tb" }
+        { text: lang === "en" ? "🚌 Buses" : "🚌 Автобусы", callback_data: "tr:type:A" },
+        { text: lang === "en" ? "🚎 Trolleybuses" : "🚎 Троллейбусы", callback_data: "tr:type:Tb" }
       ],
-      [{ text: lang === "en" ? "Minibuses" : "Маршрутки", callback_data: "tr:type:M" }],
+      [{ text: lang === "en" ? "🚐 Minibuses" : "🚐 Маршрутки", callback_data: "tr:type:M" }],
       [{ text: LABELS[lang].menu, callback_data: "menu" }]
     ]
   };
 }
 
 function dayKeyboard(lang) {
+  const l = LABELS[lang];
   return {
     inline_keyboard: [
       [
-        { text: lang === "en" ? "Today" : "Сегодня", callback_data: "day:today" },
-        { text: lang === "en" ? "Tomorrow" : "Завтра", callback_data: "day:tomorrow" }
+        { text: l.today, callback_data: "day:today" },
+        { text: l.tomorrow, callback_data: "day:tomorrow" }
       ],
       [{ text: LABELS[lang].menu, callback_data: "menu" }]
     ]
@@ -485,11 +492,15 @@ async function getWeather(city) {
   url.searchParams.set("daily", "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code");
   url.searchParams.set("forecast_days", "2");
 
-  return fetchJson(url, {
+  const data = await fetchJson(url, {
     timeoutMs: 9000,
     maxBytes: 512 * 1024,
     label: "Weather"
   });
+  if (!data || !data.current || !data.hourly || !data.daily) {
+    throw new Error("Weather response is incomplete");
+  }
+  return data;
 }
 
 async function getObservedCurrent(city) {
@@ -586,6 +597,19 @@ function describeWeatherCode(code, lang) {
   return WEATHER_CODES[lang].get(code) || (lang === "en" ? `weather code ${code}` : `код ${code}`);
 }
 
+function weatherEmoji(code) {
+  if (code === 0) return "☀️";
+  if (code === 1 || code === 2) return "🌤️";
+  if (code === 3) return "☁️";
+  if (code === 45 || code === 48) return "🌫️";
+  if (code >= 51 && code <= 55) return "🌦️";
+  if (code >= 61 && code <= 65) return "🌧️";
+  if (code >= 71 && code <= 75) return "❄️";
+  if (code >= 80 && code <= 82) return "🌧️";
+  if (code >= 95) return "⛈️";
+  return "🌡️";
+}
+
 function formatDailyWeather(city, weather, day, lang) {
   const date = getDateForDay(weather, day);
   const index = day === "tomorrow" ? 1 : 0;
@@ -597,9 +621,9 @@ function formatDailyWeather(city, weather, day, lang) {
       `<b>${formatSafeCityName(city)}</b>`,
       `Forecast for ${dayLabel(day, lang)} (${date})`,
       "",
-      `Overall: ${description}`,
-      `Temperature: from ${Math.round(weather.daily.temperature_2m_min[index])}°C to ${Math.round(weather.daily.temperature_2m_max[index])}°C`,
-      precipitation == null ? null : `Chance of precipitation: ${precipitation}%`,
+      `${weatherEmoji(weather.daily.weather_code[index])} Overall: ${description}`,
+      `🌡️ Temperature: from ${Math.round(weather.daily.temperature_2m_min[index])}°C to ${Math.round(weather.daily.temperature_2m_max[index])}°C`,
+      precipitation == null ? null : `💧 Chance of precipitation: ${precipitation}%`,
       "",
       `Timezone: ${weather.timezone}`
     ].filter(Boolean).join("\n");
@@ -609,9 +633,9 @@ function formatDailyWeather(city, weather, day, lang) {
     `<b>${formatSafeCityName(city)}</b>`,
     `Прогноз на ${dayLabel(day, lang)} (${date})`,
     "",
-    `День в целом: ${description}`,
-    `Температура: от ${Math.round(weather.daily.temperature_2m_min[index])}°C до ${Math.round(weather.daily.temperature_2m_max[index])}°C`,
-    precipitation == null ? null : `Вероятность осадков: ${precipitation}%`,
+    `${weatherEmoji(weather.daily.weather_code[index])} День в целом: ${description}`,
+    `🌡️ Температура: от ${Math.round(weather.daily.temperature_2m_min[index])}°C до ${Math.round(weather.daily.temperature_2m_max[index])}°C`,
+    precipitation == null ? null : `💧 Вероятность осадков: ${precipitation}%`,
     "",
     `Часовой пояс: ${weather.timezone}`
   ].filter(Boolean).join("\n");
@@ -629,9 +653,9 @@ function formatCurrentWeather(city, weather, lang, observedCurrent = null) {
       `<b>${formatSafeCityName(city)}</b>`,
       "Weather now",
       "",
-      `${Math.round(current.temperature_2m)}°C, ${description}`,
-      `Feels like: ${Math.round(current.apparent_temperature)}°C`,
-      `Wind: ${Math.round(current.wind_speed_10m)} km/h`,
+      `${weatherEmoji(current.weather_code)} ${Math.round(current.temperature_2m)}°C, ${description}`,
+      `🌡️ Feels like: ${Math.round(current.apparent_temperature)}°C`,
+      `💨 Wind: ${Math.round(current.wind_speed_10m)} km/h`,
       "",
       sourceLine,
       `Timezone: ${weather.timezone}`
@@ -642,9 +666,9 @@ function formatCurrentWeather(city, weather, lang, observedCurrent = null) {
     `<b>${formatSafeCityName(city)}</b>`,
     "Погода сейчас",
     "",
-    `${Math.round(current.temperature_2m)}°C, ${description}`,
-    `Ощущается как: ${Math.round(current.apparent_temperature)}°C`,
-    `Ветер: ${Math.round(current.wind_speed_10m)} км/ч`,
+    `${weatherEmoji(current.weather_code)} ${Math.round(current.temperature_2m)}°C, ${description}`,
+    `🌡️ Ощущается как: ${Math.round(current.apparent_temperature)}°C`,
+    `💨 Ветер: ${Math.round(current.wind_speed_10m)} км/ч`,
     "",
     sourceLine,
     `Часовой пояс: ${weather.timezone}`
@@ -668,10 +692,10 @@ function formatHourlyWeather(city, weather, day, hour, lang) {
       `<b>${formatSafeCityName(city)}</b>`,
       `Forecast for ${dayLabel(day, lang)} (${date}) at ${String(hour).padStart(2, "0")}:00`,
       "",
-      `${Math.round(weather.hourly.temperature_2m[index])}°C, ${description}`,
-      `Feels like: ${Math.round(weather.hourly.apparent_temperature[index])}°C`,
-      `Wind: ${Math.round(weather.hourly.wind_speed_10m[index])} km/h`,
-      precipitation == null ? null : `Chance of precipitation: ${precipitation}%`,
+      `${weatherEmoji(weather.hourly.weather_code[index])} ${Math.round(weather.hourly.temperature_2m[index])}°C, ${description}`,
+      `🌡️ Feels like: ${Math.round(weather.hourly.apparent_temperature[index])}°C`,
+      `💨 Wind: ${Math.round(weather.hourly.wind_speed_10m[index])} km/h`,
+      precipitation == null ? null : `💧 Chance of precipitation: ${precipitation}%`,
       "",
       `Timezone: ${weather.timezone}`
     ].filter(Boolean).join("\n");
@@ -681,10 +705,10 @@ function formatHourlyWeather(city, weather, day, hour, lang) {
     `<b>${formatSafeCityName(city)}</b>`,
     `Прогноз на ${dayLabel(day, lang)} (${date}) в ${String(hour).padStart(2, "0")}:00`,
     "",
-    `${Math.round(weather.hourly.temperature_2m[index])}°C, ${description}`,
-    `Ощущается как: ${Math.round(weather.hourly.apparent_temperature[index])}°C`,
-    `Ветер: ${Math.round(weather.hourly.wind_speed_10m[index])} км/ч`,
-    precipitation == null ? null : `Вероятность осадков: ${precipitation}%`,
+    `${weatherEmoji(weather.hourly.weather_code[index])} ${Math.round(weather.hourly.temperature_2m[index])}°C, ${description}`,
+    `🌡️ Ощущается как: ${Math.round(weather.hourly.apparent_temperature[index])}°C`,
+    `💨 Ветер: ${Math.round(weather.hourly.wind_speed_10m[index])} км/ч`,
+    precipitation == null ? null : `💧 Вероятность осадков: ${precipitation}%`,
     "",
     `Часовой пояс: ${weather.timezone}`
   ].filter(Boolean).join("\n");
@@ -875,9 +899,9 @@ function transportTypeName(type, lang) {
 
 function transportIcon(type) {
   const normalized = normalizeTransportType(type);
-  if (normalized === "Тб") return "Тб";
-  if (normalized === "М") return "М";
-  return "А";
+  if (normalized === "Тб") return "🚎";
+  if (normalized === "М") return "🚐";
+  return "🚌";
 }
 
 function safeCallbackText(value) {
@@ -1118,6 +1142,27 @@ async function getTransportRoutes() {
   return routes;
 }
 
+async function getBtransRouteNumbers(type) {
+  const normalized = normalizeTransportType(type);
+  const slug = btransSlugForType(normalized);
+  if (!slug) return [];
+
+  const cached = transportCache.routeLists.get(slug);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const html = await fetchText(`https://grodno.btrans.by/${slug}`);
+  const pattern = new RegExp(`href="https:\\/\\/grodno\\.btrans\\.by\\/${slug}\\/([^"/?#]+)"`, "g");
+  const numbers = [...new Set(
+    [...html.matchAll(pattern)]
+      .map((match) => decodeHtml(match[1]).trim())
+      .filter(Boolean)
+  )].sort((a, b) => Number(a) - Number(b) || a.localeCompare(b, "ru"));
+
+  if (!numbers.length) throw new Error(`BTrans returned no ${slug} routes`);
+  transportCache.routeLists.set(slug, { value: numbers, expiresAt: Date.now() + 30 * 60 * 1000 });
+  return numbers;
+}
+
 async function getTransportStops() {
   const now = Date.now();
   if (transportCache.stops.value && transportCache.stops.expiresAt > now) {
@@ -1178,9 +1223,9 @@ function routeListKeyboard(routes, type, lang) {
 
   const buttons = [...byNumber.values()]
     .sort((a, b) => Number(a.num) - Number(b.num) || a.num.localeCompare(b.num, "ru"))
-    .slice(0, 48)
+    .slice(0, 96)
     .map((route) => ({
-      text: `${transportIcon(route.type)}-${route.num}`,
+      text: `${transportIcon(route.type)} ${route.num}`,
       callback_data: `tr:route:${safeCallbackText(route.type)}:${safeCallbackText(route.num)}`
     }));
 
@@ -1307,21 +1352,21 @@ function formatBtransSchedule(schedule, lang) {
     ? `<b>${escapeHtml(schedule.title)}</b>`
     : `<b>${escapeHtml(schedule.title)}</b>`;
   const direction = schedule.direction
-    ? (lang === "en" ? `Direction: ${escapeHtml(schedule.direction)}` : `Направление: ${escapeHtml(schedule.direction)}`)
+    ? (lang === "en" ? `🧭 Direction: ${escapeHtml(schedule.direction)}` : `🧭 Направление: ${escapeHtml(schedule.direction)}`)
     : null;
 
   return [
     header,
-    schedule.stopName ? `Остановка: ${escapeHtml(schedule.stopName)}` : null,
+    schedule.stopName ? `🚏 Остановка: ${escapeHtml(schedule.stopName)}` : null,
     direction,
     "",
-    "<b>Будни:</b>",
-    ...weekdays.map(escapeHtml),
+    "📅 <b>Будни</b>",
+    ...weekdays.map((line) => `🕒 ${escapeHtml(line)}`),
     "",
-    "<b>Выходные:</b>",
-    ...weekend.map(escapeHtml),
+    "🗓️ <b>Выходные</b>",
+    ...weekend.map((line) => `🕒 ${escapeHtml(line)}`),
     "",
-    "* — в гараж"
+    "ℹ️ * — в гараж"
   ].filter(Boolean).join("\n");
 }
 
@@ -1337,8 +1382,8 @@ function formatArrival(value, lang) {
 
 function formatStopForecast(stop, forecasts, lang) {
   const title = lang === "en"
-    ? `<b>${escapeHtml(stopLabel(stop))}</b>\nNearest arrivals:`
-    : `<b>${escapeHtml(stopLabel(stop))}</b>\nБлижайшие прибытия:`;
+    ? `🚏 <b>${escapeHtml(stopLabel(stop))}</b>\n⏱️ Nearest arrivals:`
+    : `🚏 <b>${escapeHtml(stopLabel(stop))}</b>\n⏱️ Ближайшие прибытия:`;
 
   if (!forecasts.length) {
     return [
@@ -1351,9 +1396,9 @@ function formatStopForecast(stop, forecasts, lang) {
   }
 
   const lines = forecasts.slice(0, 12).map((item) => {
-    const route = `${transportIcon(item.routeType)}-${item.routeNum}`.replace(/-$/, "");
+    const route = `${transportIcon(item.routeType)} ${item.routeNum}`.trim();
     const where = item.whereGo ? ` -> ${item.whereGo}` : "";
-    return `${route}: ${formatArrival(item.arrTime, lang)}${escapeHtml(where)}`;
+    return `${route} — <b>${formatArrival(item.arrTime, lang)}</b>${escapeHtml(where)}`;
   });
 
   return [title, "", ...lines].join("\n");
@@ -1363,8 +1408,8 @@ async function showTransportMenu(chatId) {
   const lang = langOf(chatId);
   resetToMenu(chatId);
   await sendMessage(chatId, lang === "en"
-    ? "Grodno transport. Search by stop or choose route type:"
-    : "Транспорт Гродно. Можно найти остановку или выбрать тип маршрута:", {
+    ? "🚌 <b>Grodno transport</b>\n\nSearch by stop or choose route type:"
+    : "🚌 <b>Транспорт Гродно</b>\n\nНайди остановку или выбери тип маршрута:", {
       reply_markup: transportMenuKeyboard(lang)
     });
 }
@@ -1430,8 +1475,8 @@ async function showRoutesByType(chatId, type) {
     return;
   }
 
-  const routes = await getTransportRoutes();
-  const count = routes.filter((route) => route.type === normalized).length;
+  const routeNumbers = await getBtransRouteNumbers(normalized);
+  const routes = routeNumbers.map((num) => ({ type: normalized, num }));
   const title = normalized === "М" ? "Маршрутки" : `${transportTypeName(normalized, lang)}ы`;
 
   await sendMessage(chatId, lang === "en"
@@ -1440,7 +1485,7 @@ async function showRoutesByType(chatId, type) {
       reply_markup: routeListKeyboard(routes, normalized, lang)
     });
 
-  if (!count) {
+  if (!routeNumbers.length) {
     await sendMessage(chatId, lang === "en"
       ? "The transport service returned no routes for this type right now."
       : "Транспортный сервис сейчас не вернул маршруты этого типа.", {
@@ -1507,7 +1552,14 @@ async function showRouteTerminalStops(chatId, routeId) {
 
 async function sendWeather(chatId, cityQuery, day = "today", timeChoice = { type: "daily" }) {
   const lang = langOf(chatId);
-  const city = await findCity(cityQuery, lang);
+  let city;
+  try {
+    city = await findCity(cityQuery, lang);
+  } catch (error) {
+    console.error("Geocoding error:", error.message);
+    await sendMessage(chatId, lang === "en" ? "Weather search is temporarily unavailable. Try again in a minute." : "Поиск города временно недоступен. Попробуй ещё раз через минуту.", { reply_markup: menuKeyboard(lang) });
+    return;
+  }
   if (!city) {
     const text = lang === "en"
       ? `I could not find "${escapeHtml(cityQuery)}". Try a more exact city name.`
@@ -1516,7 +1568,14 @@ async function sendWeather(chatId, cityQuery, day = "today", timeChoice = { type
     return;
   }
 
-  const weather = await getWeather(city);
+  let weather;
+  try {
+    weather = await getWeather(city);
+  } catch (error) {
+    console.error("Weather error:", error.message);
+    await sendMessage(chatId, lang === "en" ? "The forecast is temporarily unavailable. Try again in a minute." : "Прогноз временно недоступен. Попробуй ещё раз через минуту.", { reply_markup: menuKeyboard(lang) });
+    return;
+  }
   let message;
   let adviceContext;
 
@@ -1829,6 +1888,7 @@ async function handleMessage(message) {
   const chatId = message.chat.id;
   const text = (message.text || "").trim();
   if (!text) return;
+  const command = text.split(/\s+/, 1)[0].replace(/@[\w_]+$/i, "");
 
   const lang = langOf(chatId);
 
@@ -1846,19 +1906,19 @@ async function handleMessage(message) {
     return;
   }
 
-  if (text === "/start") {
+  if (command === "/start") {
     resetToMenu(chatId);
     await sendLanguageChoice(chatId);
     return;
   }
 
-  if (text === "/menu") {
+  if (command === "/menu") {
     resetToMenu(chatId);
     await showMenu(chatId);
     return;
   }
 
-  if (text === "/help") {
+  if (command === "/help") {
     await sendMessage(chatId, helpText(lang), { reply_markup: menuKeyboard(lang) });
     return;
   }
@@ -1952,7 +2012,8 @@ function startWebhookServer() {
       }
 
       if (req.method === "POST" && req.url === WEBHOOK_PATH) {
-        if (WEBHOOK_SECRET && req.headers["x-telegram-bot-api-secret-token"] !== WEBHOOK_SECRET) {
+        const secretMatches = !WEBHOOK_SECRET || req.headers["x-telegram-bot-api-secret-token"] === WEBHOOK_SECRET;
+        if (!secretMatches) {
           res.writeHead(403, securityHeaders());
           res.end("forbidden");
           return;
@@ -2025,9 +2086,23 @@ if (PORT && !WEBHOOK_SECRET) {
   process.exit(1);
 }
 
+async function startPollingSafely() {
+  try {
+    const webhook = await telegram("getWebhookInfo", {});
+    if (webhook?.url) {
+      console.error(`Webhook is active at ${webhook.url}. Local polling was not started to avoid Telegram conflicts.`);
+      return;
+    }
+  } catch (error) {
+    console.error("Could not verify webhook status:", error.message);
+    return;
+  }
+  console.log("Weather bot is running. Press Ctrl+C to stop.");
+  poll();
+}
+
 if (PORT) {
   startWebhookServer();
 } else {
-  console.log("Weather bot is running. Press Ctrl+C to stop.");
-  poll();
+  startPollingSafely();
 }
