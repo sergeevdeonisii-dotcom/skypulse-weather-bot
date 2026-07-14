@@ -2459,6 +2459,24 @@ async function configureWebhook(baseUrl) {
   console.log(`Telegram webhook set for host: ${new URL(webhookUrl).host}`);
 }
 
+async function logWebhookStatus() {
+  try {
+    const info = await telegram("getWebhookInfo", {});
+    let host = "unknown";
+    let pathMatches = false;
+    try {
+      const configuredUrl = new URL(String(info?.url || ""));
+      host = configuredUrl.host;
+      pathMatches = configuredUrl.pathname === WEBHOOK_PATH;
+    } catch {}
+    const pending = Number.isFinite(Number(info?.pending_update_count)) ? Number(info.pending_update_count) : 0;
+    const lastError = String(info?.last_error_message || "none").slice(0, 220);
+    console.log(`Telegram webhook status: host=${host}, pathMatches=${pathMatches}, pending=${pending}, lastError=${lastError}`);
+  } catch (error) {
+    console.error("Telegram webhook status error:", error.message);
+  }
+}
+
 function readRequestBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -2543,6 +2561,7 @@ function startWebhookServer() {
     if (baseUrl) {
       try {
         await configureWebhook(baseUrl);
+        await logWebhookStatus();
       } catch (error) {
         console.error("Webhook setup error:", error.message);
       }
