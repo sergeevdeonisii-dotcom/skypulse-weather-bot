@@ -2477,6 +2477,15 @@ async function logWebhookStatus() {
   }
 }
 
+async function logTelegramBotIdentity() {
+  try {
+    const bot = await telegram("getMe", {});
+    console.log(`Telegram bot identity: @${String(bot?.username || "unknown")}`);
+  } catch (error) {
+    console.error("Telegram bot identity error:", error.message);
+  }
+}
+
 function readRequestBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -2561,6 +2570,7 @@ function startWebhookServer() {
     if (baseUrl) {
       try {
         await configureWebhook(baseUrl);
+        await logTelegramBotIdentity();
         await logWebhookStatus();
       } catch (error) {
         console.error("Webhook setup error:", error.message);
