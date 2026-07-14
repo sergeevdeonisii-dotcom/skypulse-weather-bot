@@ -34,11 +34,14 @@ const MAX_CALLBACK_TOKENS = 500;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const ADVICE_TTL_MS = 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_FAVORITE_ROUTES = 12;
+const PREFERENCES_FILE = process.env.PREFERENCES_FILE || path.join(__dirname, "data", "user-preferences.json");
 
 const userSessions = new Map();
 const userLanguages = new Map();
 const lastClothingAdvice = new Map();
 const rateBuckets = new Map();
+const userPreferences = new Map();
 const transportCache = {
   routes: { value: null, expiresAt: 0 },
   stops: { value: null, expiresAt: 0 },
@@ -224,6 +227,125 @@ function languageKeyboard() {
   };
 }
 
+function savedCityFrom(value) {
+  if (!value || typeof value !== "object") return null;
+  const latitude = Number(value.latitude);
+  const longitude = Number(value.longitude);
+  const name = String(value.name || "").trim().slice(0, 100);
+  if (!name || !Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  return {
+    name,
+    admin1: String(value.admin1 || "").trim().slice(0, 100),
+    country: String(value.country || "").trim().slice(0, 100),
+    latitude,
+    longitude,
+    timezone: String(value.timezone || "").trim().slice(0, 80)
+  };
+}
+
+function favoriteRouteFrom(value) {
+  if (!value || typeof value !== "object") return null;
+  const type = normalizeTransportType(String(value.type || ""));
+  const num = String(value.num || "").trim().slice(0, 16);
+  if (!(["А", "Тб"].includes(type)) || !num || /[:\r\n]/.test(num)) return null;
+  return { type, num };
+}
+
+function normalizedPreferences(value) {
+  const city = savedCityFrom(value?.city);
+  const favorites = [];
+  for (const item of Array.isArray(value?.favorites) ? value.favorites : []) {
+    const route = favoriteRouteFrom(item);
+    if (route && !favorites.some((saved) => saved.type === route.type && saved.num === route.num)) {
+      favorites.push(route);
+    }
+    if (favorites.length >= MAX_FAVORITE_ROUTES) break;
+  }
+  return { city, favorites };
+}
+
+function loadUserPreferences() {
+  try {
+    if (!fs.existsSync(PREFERENCES_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(PREFERENCES_FILE, "utf8"));
+    if (!saved || typeof saved !== "object" || Array.isArray(saved)) return;
+    for (const [chatId, value] of Object.entries(saved)) {
+      if (!/^\d{1,20}$/.test(chatId)) continue;
+      const preferences = normalizedPreferences(value);
+      if (preferences.city || preferences.favorites.length) userPreferences.set(chatId, preferences);
+    }
+  } catch (error) {
+    console.error("Could not load user preferences:", error.message);
+  }
+}
+
+function persistUserPreferences() {
+  try {
+    fs.mkdirSync(path.dirname(PREFERENCES_FILE), { recursive: true });
+    const saved = Object.fromEntries(userPreferences.entries());
+    const tempFile = `${PREFERENCES_FILE}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(saved), "utf8");
+    try {
+      fs.renameSync(tempFile, PREFERENCES_FILE);
+    } catch {
+      fs.writeFileSync(PREFERENCES_FILE, JSON.stringify(saved), "utf8");
+      fs.rmSync(tempFile, { force: true });
+    }
+  } catch (error) {
+    console.error("Could not save user preferences:", error.message);
+  }
+}
+
+function preferencesOf(chatId) {
+  return userPreferences.get(String(chatId)) || { city: null, favorites: [] };
+}
+
+function updatePreferences(chatId, updater) {
+  const key = String(chatId);
+  const current = preferencesOf(key);
+  const next = normalizedPreferences(updater({ city: current.city, favorites: [...current.favorites] }));
+  if (next.city || next.favorites.length) {
+    userPreferences.set(key, next);
+  } else {
+    userPreferences.delete(key);
+  }
+  persistUserPreferences();
+  return next;
+}
+
+function setSavedCity(chatId, city) {
+  const savedCity = savedCityFrom(city);
+  if (!savedCity) return preferencesOf(chatId);
+  return updatePreferences(chatId, (preferences) => ({ ...preferences, city: savedCity }));
+}
+
+function clearSavedCity(chatId) {
+  return updatePreferences(chatId, (preferences) => ({ ...preferences, city: null }));
+}
+
+function isFavoriteRoute(chatId, type, num) {
+  return preferencesOf(chatId).favorites.some((route) => route.type === type && route.num === String(num));
+}
+
+function toggleFavoriteRoute(chatId, type, num) {
+  const route = favoriteRouteFrom({ type, num });
+  if (!route) return { changed: false, favorites: preferencesOf(chatId).favorites };
+  const current = preferencesOf(chatId);
+  const exists = current.favorites.some((item) => item.type === route.type && item.num === route.num);
+  if (!exists && current.favorites.length >= MAX_FAVORITE_ROUTES) {
+    return { changed: false, limitReached: true, favorites: current.favorites };
+  }
+  const preferences = updatePreferences(chatId, (value) => ({
+    ...value,
+    favorites: exists
+      ? value.favorites.filter((item) => item.type !== route.type || item.num !== route.num)
+      : [...value.favorites, route]
+  }));
+  return { changed: true, added: !exists, favorites: preferences.favorites };
+}
+
+loadUserPreferences();
+
 function menuKeyboard(lang) {
   return {
     inline_keyboard: [
@@ -234,7 +356,8 @@ function menuKeyboard(lang) {
       [
         { text: LABELS[lang].help, callback_data: "help" },
         { text: LABELS[lang].language, callback_data: "choose_lang" }
-      ]
+      ],
+      [{ text: lang === "en" ? "ℹ️ Information" : "ℹ️ Информация", callback_data: "info_menu" }]
     ]
   };
 }
@@ -295,6 +418,7 @@ function timeKeyboard(lang) {
         { text: l.night, callback_data: "time:21" },
         { text: l.allDay, callback_data: "time:daily" }
       ],
+      [{ text: lang === "en" ? "✏️ Another city" : "✏️ Другой город", callback_data: "city:change" }],
       [{ text: l.menu, callback_data: "menu" }]
     ]
   };
@@ -352,6 +476,111 @@ function helpText(lang) {
     "",
     "Пример: «Погода завтра» -> напиши Москва -> «День 15:00» -> «А что по одежде?»."
   ].join("\n");
+}
+
+function savedCityLabel(city) {
+  return city ? formatCityName(city) : "";
+}
+
+function informationKeyboard(chatId, lang) {
+  const preferences = preferencesOf(chatId);
+  const cityLabel = savedCityLabel(preferences.city);
+  return {
+    inline_keyboard: [
+      [{
+        text: cityLabel
+          ? (lang === "en" ? `🏙️ My city: ${cityLabel}` : `🏙️ Мой город: ${cityLabel}`)
+          : (lang === "en" ? "🏙️ Set my city" : "🏙️ Указать мой город"),
+        callback_data: "info:city"
+      }],
+      [{
+        text: lang === "en"
+          ? `⭐ Favourite routes (${preferences.favorites.length})`
+          : `⭐ Избранные маршруты (${preferences.favorites.length})`,
+        callback_data: "fav:menu"
+      }],
+      [{ text: LABELS[lang].menu, callback_data: "menu" }]
+    ]
+  };
+}
+
+function citySettingsKeyboard(chatId, lang) {
+  const hasCity = Boolean(preferencesOf(chatId).city);
+  const rows = [[{
+    text: lang === "en" ? "✏️ Set or change city" : "✏️ Указать или изменить город",
+    callback_data: "info:city_set"
+  }]];
+  if (hasCity) {
+    rows.push([{
+      text: lang === "en" ? "🗑️ Remove saved city" : "🗑️ Удалить сохранённый город",
+      callback_data: "info:city_clear"
+    }]);
+  }
+  rows.push([{ text: lang === "en" ? "← Information" : "← Информация", callback_data: "info_menu" }]);
+  return { inline_keyboard: rows };
+}
+
+function favoriteRoutesKeyboard(chatId, lang) {
+  const favorites = preferencesOf(chatId).favorites;
+  const rows = favorites.map((route) => ([
+    {
+      text: `${transportIcon(route.type)} ${transportTypeName(route.type, lang)} ${route.num}`.slice(0, 54),
+      callback_data: `tr:route:${safeCallbackText(route.type)}:${safeCallbackText(route.num)}`
+    },
+    {
+      text: lang === "en" ? "✕ Remove" : "✕ Убрать",
+      callback_data: `fav:remove:${safeCallbackText(route.type)}:${safeCallbackText(route.num)}`
+    }
+  ]));
+  rows.push([{ text: lang === "en" ? "← Information" : "← Информация", callback_data: "info_menu" }]);
+  return { inline_keyboard: rows };
+}
+
+async function showInformation(chatId) {
+  const lang = langOf(chatId);
+  resetToMenu(chatId);
+  const preferences = preferencesOf(chatId);
+  const city = savedCityLabel(preferences.city);
+  const text = lang === "en"
+    ? [
+        "ℹ️ <b>Information</b>",
+        "",
+        city ? `🏙️ My city: <b>${escapeHtml(city)}</b>` : "🏙️ My city is not set yet.",
+        `⭐ Favourite bus and trolleybus routes: <b>${preferences.favorites.length}</b>`
+      ].join("\n")
+    : [
+        "ℹ️ <b>Информация</b>",
+        "",
+        city ? `🏙️ Мой город: <b>${escapeHtml(city)}</b>` : "🏙️ Мой город пока не указан.",
+        `⭐ Избранных маршрутов автобусов и троллейбусов: <b>${preferences.favorites.length}</b>`
+      ].join("\n");
+  await sendMessage(chatId, text, { reply_markup: informationKeyboard(chatId, lang) });
+}
+
+async function showCitySettings(chatId) {
+  const lang = langOf(chatId);
+  const city = savedCityLabel(preferencesOf(chatId).city);
+  const text = lang === "en"
+    ? [
+        "🏙️ <b>My city</b>",
+        "",
+        city ? `Saved: <b>${escapeHtml(city)}</b>. Weather will use it automatically.` : "Save a city to skip typing it for every forecast."
+      ].join("\n")
+    : [
+        "🏙️ <b>Мой город</b>",
+        "",
+        city ? `Сохранён: <b>${escapeHtml(city)}</b>. Прогноз будет использовать его автоматически.` : "Сохрани город, чтобы не вводить его для каждого прогноза."
+      ].join("\n");
+  await sendMessage(chatId, text, { reply_markup: citySettingsKeyboard(chatId, lang) });
+}
+
+async function showFavoriteRoutes(chatId) {
+  const lang = langOf(chatId);
+  const favorites = preferencesOf(chatId).favorites;
+  const text = lang === "en"
+    ? (favorites.length ? "⭐ <b>Favourite routes</b>\n\nChoose a route to open its timetable." : "⭐ <b>Favourite routes</b>\n\nOpen a bus or trolleybus route and tap ‘Add to favourites’.")
+    : (favorites.length ? "⭐ <b>Избранные маршруты</b>\n\nНажми маршрут, чтобы открыть расписание." : "⭐ <b>Избранные маршруты</b>\n\nОткрой автобусный или троллейбусный маршрут и нажми «В избранное».");
+  await sendMessage(chatId, text, { reply_markup: favoriteRoutesKeyboard(chatId, lang) });
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
@@ -1362,7 +1591,7 @@ function routeDetailKeyboard(routeDirections, lang) {
 
 function btransStopsKeyboard(route, directionIndex, lang, chatId) {
   const direction = route.directions[directionIndex];
-  const rows = direction.stops.map((stop, index) => {
+  const rows = direction.stops.slice(0, 94).map((stop, index) => {
     const token = makeCallbackToken({
       kind: "btrans_stop",
       chatId: String(chatId),
@@ -1377,6 +1606,13 @@ function btransStopsKeyboard(route, directionIndex, lang, chatId) {
     }];
   });
   rows.push([{ text: lang === "en" ? "Transport menu" : "Меню транспорта", callback_data: "transport_menu" }]);
+  const favorite = isFavoriteRoute(chatId, route.type, route.num);
+  rows.splice(Math.max(0, rows.length - 1), 0, [{
+    text: favorite
+      ? (lang === "en" ? "⭐ In favourites" : "⭐ В избранном")
+      : (lang === "en" ? "☆ Add to favourites" : "☆ В избранное"),
+    callback_data: `fav:toggle:${safeCallbackText(route.type)}:${safeCallbackText(route.num)}`
+  }]);
   return { inline_keyboard: rows.slice(0, 96) };
 }
 
@@ -1663,7 +1899,10 @@ async function showRouteTerminalStops(chatId, routeId) {
 async function sendWeather(chatId, cityQuery, day = "today", timeChoice = { type: "daily" }) {
   const lang = langOf(chatId);
   let city;
-  try {
+  const savedCity = savedCityFrom(cityQuery);
+  if (savedCity) {
+    city = savedCity;
+  } else try {
     city = await findCity(cityQuery, lang);
   } catch (error) {
     console.error("Geocoding error:", error.message);
@@ -1770,6 +2009,31 @@ async function handleSession(chatId, text, session) {
   const lang = langOf(chatId);
   session.updatedAt = Date.now();
 
+  if (session.step === "saved_city") {
+    let city;
+    try {
+      city = await findCity(text, lang);
+    } catch (error) {
+      console.error("Saved city lookup error:", error.message);
+      await sendMessage(chatId, lang === "en" ? "City search is temporarily unavailable. Try again in a minute." : "Поиск города временно недоступен. Попробуй ещё раз через минуту.");
+      return;
+    }
+    if (!city) {
+      await sendMessage(chatId, lang === "en"
+        ? `I could not find "${escapeHtml(text)}". Type the city name more precisely.`
+        : `Не нашёл город «${escapeHtml(text)}». Напиши название точнее.`);
+      return;
+    }
+    const preferences = setSavedCity(chatId, city);
+    resetToMenu(chatId);
+    await sendMessage(chatId, lang === "en"
+      ? `✅ Saved city: <b>${escapeHtml(formatCityName(preferences.city))}</b>`
+      : `✅ Сохранённый город: <b>${escapeHtml(formatCityName(preferences.city))}</b>`, {
+        reply_markup: informationKeyboard(chatId, lang)
+      });
+    return;
+  }
+
   if (session.step === "transport_stop_search") {
     resetToMenu(chatId);
     await sendStopSearchResults(chatId, text);
@@ -1849,6 +2113,69 @@ async function handleCallbackQuery(callbackQuery) {
 
   if (data === "help") {
     await sendMessage(chatId, helpText(lang), { reply_markup: menuKeyboard(lang) });
+    return;
+  }
+
+  if (data === "info_menu") {
+    await showInformation(chatId);
+    return;
+  }
+
+  if (data === "info:city") {
+    await showCitySettings(chatId);
+    return;
+  }
+
+  if (data === "info:city_set") {
+    userSessions.set(chatId, { step: "saved_city", updatedAt: Date.now() });
+    await sendMessage(chatId, lang === "en"
+      ? "🏙️ Type the city you want to save for weather forecasts."
+      : "🏙️ Напиши город, который нужно сохранить для прогнозов.");
+    return;
+  }
+
+  if (data === "info:city_clear") {
+    clearSavedCity(chatId);
+    await sendMessage(chatId, lang === "en" ? "Saved city removed." : "Сохранённый город удалён.", {
+      reply_markup: informationKeyboard(chatId, lang)
+    });
+    return;
+  }
+
+  if (data === "fav:menu") {
+    await showFavoriteRoutes(chatId);
+    return;
+  }
+
+  if (data.startsWith("fav:toggle:") || data.startsWith("fav:remove:")) {
+    const [, action, type, num] = data.split(":");
+    const route = favoriteRouteFrom({ type, num });
+    if (!route) {
+      await sendMessage(chatId, lang === "en" ? "This route button is invalid. Open the route again." : "Кнопка маршрута устарела. Открой маршрут заново.", {
+        reply_markup: transportMenuKeyboard(lang)
+      });
+      return;
+    }
+
+    if (action === "remove") {
+      updatePreferences(chatId, (preferences) => ({
+        ...preferences,
+        favorites: preferences.favorites.filter((item) => item.type !== route.type || item.num !== route.num)
+      }));
+      await showFavoriteRoutes(chatId);
+      return;
+    }
+
+    const result = toggleFavoriteRoute(chatId, route.type, route.num);
+    if (result.limitReached) {
+      await sendMessage(chatId, lang === "en"
+        ? `You can save up to ${MAX_FAVORITE_ROUTES} routes. Remove one first.`
+        : `Можно сохранить до ${MAX_FAVORITE_ROUTES} маршрутов. Сначала убери один из избранного.`, {
+          reply_markup: favoriteRoutesKeyboard(chatId, lang)
+        });
+      return;
+    }
+    await showFavoriteRoutes(chatId);
     return;
   }
 
@@ -1953,10 +2280,31 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
+  if (data === "city:change") {
+    const session = userSessions.get(chatId);
+    if (!session?.day) {
+      await sendMessage(chatId, lang === "en" ? "First choose the forecast day." : "Сначала выбери день прогноза.", {
+        reply_markup: weatherMenuKeyboard(lang)
+      });
+      return;
+    }
+    session.city = null;
+    session.step = "city";
+    session.updatedAt = Date.now();
+    await askForCity(chatId, session.day);
+    return;
+  }
+
   if (data.startsWith("day:")) {
     const day = data.endsWith("tomorrow") ? "tomorrow" : "today";
-    startFlow(chatId, day);
-    await askForCity(chatId, day);
+    const savedCity = preferencesOf(chatId).city;
+    if (savedCity) {
+      userSessions.set(chatId, { step: "time", day, city: savedCity, updatedAt: Date.now() });
+      await askForTime(chatId, day, formatCityName(savedCity));
+    } else {
+      startFlow(chatId, day);
+      await askForCity(chatId, day);
+    }
     return;
   }
 
