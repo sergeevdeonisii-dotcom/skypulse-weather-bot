@@ -409,7 +409,7 @@ async function fetchJson(url, {
   label = "External API"
 } = {}) {
   const response = await fetchWithTimeout(url, { headers }, timeoutMs);
-  if (!response.ok) throw new Error(`${label} request failed`);
+  if (!response.ok) throw new Error(`${label} request failed (HTTP ${response.status})`);
 
   const text = await readLimitedFetchText(response, maxBytes);
   try {
@@ -477,9 +477,113 @@ async function findCity(query, lang) {
   const data = await fetchJson(url, {
     timeoutMs: 8000,
     maxBytes: 256 * 1024,
+    headers: WEATHER_REQUEST_HEADERS,
     label: "Geocoding"
   });
   return data.results?.[0] || null;
+}
+
+const WEATHER_REQUEST_HEADERS = Object.freeze({
+  "User-Agent": "SkyPulse Weather Bot/1.0 (+https://github.com/sergeevdeonisii-dotcom/skypulse-weather-bot)",
+  "Accept": "application/json"
+});
+
+function wttrWeatherCode(value) {
+  const code = Number(value);
+  if (code === 113) return 0;
+  if (code === 116) return 1;
+  if (code === 119 || code === 122) return 3;
+  if (code === 143 || code === 248 || code === 260) return 45;
+  if ([176, 263, 266, 293, 296, 353].includes(code)) return 51;
+  if ([299, 302, 305, 308, 356, 359].includes(code)) return 63;
+  if ([281, 284, 311, 314, 317, 362, 365].includes(code)) return 56;
+  if ([179, 227, 230, 320, 323, 326, 329, 332, 335, 338, 368, 371].includes(code)) return 71;
+  if ([350, 374, 377].includes(code)) return 77;
+  if ([200, 386, 389, 392, 395].includes(code)) return 95;
+  return 3;
+}
+
+function wttrHour(value) {
+  const hour = Math.floor(Number(value || 0) / 100);
+  return Number.isFinite(hour) ? Math.min(23, Math.max(0, hour)) : 0;
+}
+
+function wttrSlotForHour(slots, wantedHour) {
+  return slots.reduce((closest, slot) => {
+    if (!closest) return slot;
+    return Math.abs(wttrHour(slot.time) - wantedHour) < Math.abs(wttrHour(closest.time) - wantedHour)
+      ? slot
+      : closest;
+  }, null);
+}
+
+function finiteNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+async function getWttrForecast(city) {
+  const url = new URL(`https://wttr.in/${city.latitude},${city.longitude}`);
+  url.searchParams.set("format", "j1");
+
+  const data = await fetchJson(url, {
+    timeoutMs: 9000,
+    maxBytes: 512 * 1024,
+    headers: WEATHER_REQUEST_HEADERS,
+    label: "Weather fallback"
+  });
+  const days = data.weather?.slice(0, 2).filter((day) => day?.date && Array.isArray(day.hourly)) || [];
+  const observed = data.current_condition?.[0];
+  if (days.length < 2 || !observed) throw new Error("Weather fallback response is incomplete");
+
+  const hourly = {
+    time: [],
+    temperature_2m: [],
+    apparent_temperature: [],
+    precipitation_probability: [],
+    weather_code: [],
+    wind_speed_10m: []
+  };
+  const daily = {
+    time: [],
+    temperature_2m_max: [],
+    temperature_2m_min: [],
+    precipitation_probability_max: [],
+    weather_code: []
+  };
+
+  for (const day of days) {
+    const slots = day.hourly.filter(Boolean);
+    if (!slots.length) throw new Error("Weather fallback has no hourly forecast");
+    const noon = wttrSlotForHour(slots, 12);
+    daily.time.push(day.date);
+    daily.temperature_2m_max.push(finiteNumber(day.maxtempC));
+    daily.temperature_2m_min.push(finiteNumber(day.mintempC));
+    daily.precipitation_probability_max.push(Math.max(...slots.map((slot) => finiteNumber(slot.chanceofrain))));
+    daily.weather_code.push(wttrWeatherCode(noon.weatherCode));
+
+    for (let hour = 0; hour < 24; hour += 1) {
+      const slot = wttrSlotForHour(slots, hour);
+      hourly.time.push(`${day.date}T${String(hour).padStart(2, "0")}:00`);
+      hourly.temperature_2m.push(finiteNumber(slot.tempC));
+      hourly.apparent_temperature.push(finiteNumber(slot.FeelsLikeC, finiteNumber(slot.tempC)));
+      hourly.precipitation_probability.push(finiteNumber(slot.chanceofrain));
+      hourly.weather_code.push(wttrWeatherCode(slot.weatherCode));
+      hourly.wind_speed_10m.push(finiteNumber(slot.windspeedKmph));
+    }
+  }
+
+  return {
+    timezone: city.timezone || "UTC",
+    current: {
+      temperature_2m: finiteNumber(observed.temp_C),
+      apparent_temperature: finiteNumber(observed.FeelsLikeC, finiteNumber(observed.temp_C)),
+      weather_code: wttrWeatherCode(observed.weatherCode),
+      wind_speed_10m: finiteNumber(observed.windspeedKmph)
+    },
+    hourly,
+    daily
+  };
 }
 
 async function getWeather(city) {
@@ -492,15 +596,21 @@ async function getWeather(city) {
   url.searchParams.set("daily", "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code");
   url.searchParams.set("forecast_days", "2");
 
-  const data = await fetchJson(url, {
-    timeoutMs: 9000,
-    maxBytes: 512 * 1024,
-    label: "Weather"
-  });
-  if (!data || !data.current || !data.hourly || !data.daily) {
-    throw new Error("Weather response is incomplete");
+  try {
+    const data = await fetchJson(url, {
+      timeoutMs: 9000,
+      maxBytes: 512 * 1024,
+      headers: WEATHER_REQUEST_HEADERS,
+      label: "Weather"
+    });
+    if (!data || !data.current || !data.hourly || !data.daily) {
+      throw new Error("Weather response is incomplete");
+    }
+    return data;
+  } catch (primaryError) {
+    console.warn("Open-Meteo failed, using weather fallback:", primaryError.message);
+    return getWttrForecast(city);
   }
-  return data;
 }
 
 async function getObservedCurrent(city) {
@@ -510,7 +620,7 @@ async function getObservedCurrent(city) {
   const data = await fetchJson(url, {
     timeoutMs: 8000,
     maxBytes: 512 * 1024,
-    headers: { "User-Agent": "SkyPulseWeatherBot/1.0" },
+    headers: WEATHER_REQUEST_HEADERS,
     label: "Observed weather"
   });
   const current = data.current_condition?.[0];
