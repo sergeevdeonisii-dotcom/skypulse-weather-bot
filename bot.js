@@ -2475,6 +2475,22 @@ async function configureWebhook(baseUrl) {
   console.log(`Telegram webhook set for host: ${new URL(webhookUrl).host}`);
 }
 
+async function configureMiniAppMenuButton() {
+  const url = getMiniAppUrl();
+  if (!url) {
+    console.warn("Mini App menu button was skipped because its URL is missing.");
+    return;
+  }
+  await telegram("setChatMenuButton", {
+    menu_button: {
+      type: "web_app",
+      text: "Открыть",
+      web_app: { url }
+    }
+  });
+  console.log(`Telegram Mini App menu button set for host: ${new URL(url).host}`);
+}
+
 async function logWebhookStatus() {
   try {
     const info = await telegram("getWebhookInfo", {});
@@ -2547,7 +2563,7 @@ function miniAppHtml() {
       --hint: var(--tg-theme-hint-color, #6e7787);
       --accent: var(--tg-theme-button-color, #2888e8);
       --accent-text: var(--tg-theme-button-text-color, #ffffff);
-      --border: color-mix(in srgb, var(--hint) 22%, transparent);
+      --border: rgba(126, 138, 158, .28);
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -2558,6 +2574,7 @@ function miniAppHtml() {
     .muted { color: var(--hint); font-size: 14px; }
     .tabs, .route-grid { display: grid; gap: 9px; }
     .tabs { grid-template-columns: 1fr 1fr; margin-top: 20px; }
+    .app-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 16px; }
     .route-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
     button { appearance: none; border: 1px solid var(--border); border-radius: 13px; background: var(--card); color: var(--text); padding: 12px 10px; font: inherit; font-weight: 650; cursor: pointer; min-height: 46px; }
     button:active { opacity: .72; transform: scale(.985); }
@@ -2574,12 +2591,43 @@ function miniAppHtml() {
     .schedule-line { padding: 5px 0; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
     .notice { min-height: 21px; margin-top: 13px; color: var(--hint); font-size: 14px; }
     .notice.error { color: #d84f4f; }
+    .weather-search { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin-top: 16px; }
+    input { width: 100%; min-height: 46px; border: 1px solid var(--border); border-radius: 13px; background: var(--card); color: var(--text); padding: 11px 13px; font: inherit; outline: none; }
+    input:focus { border-color: var(--accent); }
+    .weather-now { font-size: 23px; font-weight: 750; margin-top: 4px; }
+    .forecast-days { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+    .forecast-day { padding: 12px; border: 1px solid var(--border); border-radius: 13px; }
+    .forecast-day strong { display: block; }
     [hidden] { display: none !important; }
-    @media (max-width: 360px) { .route-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } .schedule-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 360px) { .route-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } .schedule-grid, .forecast-days { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <main>
+    <section class="app-tabs" aria-label="Раздел">
+      <button id="weather-tab" class="selected" type="button">🌤️ Погода</button>
+      <button id="transport-tab" type="button">🚌 Расписание</button>
+    </section>
+
+    <section id="weather-section">
+      <header>
+        <h1>🌤️ Погода</h1>
+        <p class="muted">Укажи город — покажем погоду сейчас, сегодня и завтра.</p>
+      </header>
+      <form id="weather-form" class="weather-search">
+        <input id="weather-city" type="search" maxlength="100" autocomplete="address-level2" placeholder="Например, Гродно" aria-label="Город">
+        <button class="primary" type="submit">Показать</button>
+      </form>
+      <div id="weather-notice" class="notice" role="status"></div>
+      <div id="weather-result" class="card" hidden>
+        <strong id="weather-city-title"></strong>
+        <p id="weather-now" class="weather-now"></p>
+        <p id="weather-details" class="muted"></p>
+        <div id="forecast-days" class="forecast-days"></div>
+      </div>
+    </section>
+
+    <div id="transport-section" hidden>
     <header>
       <h1>🚌 Расписание Гродно</h1>
       <p class="muted">Выбери маршрут и остановку — покажем время в будни и выходные.</p>
@@ -2617,6 +2665,7 @@ function miniAppHtml() {
         <p class="muted">* — в гараж</p>
       </div>
     </section>
+    </div>
   </main>
   <script>
     (function () {
@@ -2636,6 +2685,19 @@ function miniAppHtml() {
       var scheduleDirection = document.getElementById("schedule-direction");
       var weekdays = document.getElementById("weekdays");
       var weekend = document.getElementById("weekend");
+      var weatherTab = document.getElementById("weather-tab");
+      var transportTab = document.getElementById("transport-tab");
+      var weatherSection = document.getElementById("weather-section");
+      var transportSection = document.getElementById("transport-section");
+      var weatherForm = document.getElementById("weather-form");
+      var weatherCityInput = document.getElementById("weather-city");
+      var weatherNotice = document.getElementById("weather-notice");
+      var weatherResult = document.getElementById("weather-result");
+      var weatherCityTitle = document.getElementById("weather-city-title");
+      var weatherNow = document.getElementById("weather-now");
+      var weatherDetails = document.getElementById("weather-details");
+      var forecastDays = document.getElementById("forecast-days");
+      var transportLoaded = false;
 
       function setNotice(text, isError) {
         notice.textContent = text || "";
@@ -2649,6 +2711,64 @@ function miniAppHtml() {
         }).then(function (body) {
           if (!body || body.ok !== true) throw new Error("invalid response");
           return body;
+        });
+      }
+
+      function setWeatherNotice(text, isError) {
+        weatherNotice.textContent = text || "";
+        weatherNotice.className = isError ? "notice error" : "notice";
+      }
+
+      function switchSection(section) {
+        var isWeather = section === "weather";
+        weatherSection.hidden = !isWeather;
+        transportSection.hidden = isWeather;
+        weatherTab.classList.toggle("selected", isWeather);
+        transportTab.classList.toggle("selected", !isWeather);
+        if (!isWeather && !transportLoaded) {
+          transportLoaded = true;
+          loadRoutes("A");
+        }
+      }
+
+      function renderWeather(weather) {
+        weatherCityTitle.textContent = weather.city;
+        weatherNow.textContent = weather.current.emoji + " " + String(weather.current.temperature) + "°C, " + weather.current.description;
+        weatherDetails.textContent = "Ощущается как " + String(weather.current.apparent) + "°C · Ветер " + String(weather.current.wind) + " км/ч";
+        forecastDays.replaceChildren();
+        weather.days.forEach(function (day, index) {
+          var card = document.createElement("div");
+          card.className = "forecast-day";
+          var title = document.createElement("strong");
+          title.textContent = index === 0 ? "Сегодня" : "Завтра";
+          var condition = document.createElement("p");
+          condition.textContent = day.emoji + " " + day.description;
+          var temperature = document.createElement("p");
+          temperature.className = "muted";
+          temperature.textContent = String(day.min) + "…" + String(day.max) + "°C" + (day.precipitation == null ? "" : " · осадки " + String(day.precipitation) + "%");
+          card.appendChild(title);
+          card.appendChild(condition);
+          card.appendChild(temperature);
+          forecastDays.appendChild(card);
+        });
+        weatherResult.hidden = false;
+      }
+
+      function loadWeather(city) {
+        var query = String(city || "").trim();
+        if (query.length < 2) {
+          setWeatherNotice("Напиши название города.", true);
+          return;
+        }
+        setWeatherNotice("Загружаю погоду…", false);
+        request("/api/weather?city=" + encodeURIComponent(query)).then(function (data) {
+          renderWeather(data.weather);
+          weatherCityInput.value = data.weather.city.split(",")[0] || query;
+          try { localStorage.setItem("skypulse-city", weatherCityInput.value); } catch (_) {}
+          setWeatherNotice("", false);
+        }).catch(function () {
+          weatherResult.hidden = true;
+          setWeatherNotice("Не получилось найти город или загрузить погоду. Попробуй ещё раз.", true);
         });
       }
 
@@ -2768,7 +2888,17 @@ function miniAppHtml() {
         scheduleSection.hidden = true;
         routeSection.hidden = false;
       });
-      loadRoutes("A");
+      weatherTab.addEventListener("click", function () { switchSection("weather"); });
+      transportTab.addEventListener("click", function () { switchSection("transport"); });
+      weatherForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        loadWeather(weatherCityInput.value);
+      });
+      var initialCity = "Гродно";
+      try { initialCity = localStorage.getItem("skypulse-city") || initialCity; } catch (_) {}
+      weatherCityInput.value = initialCity;
+      switchSection("weather");
+      loadWeather(initialCity);
     }());
   </script>
 </body>
@@ -2785,6 +2915,54 @@ function miniAppIndex(value, size) {
   return Number.isInteger(index) && index >= 0 && index < size ? index : -1;
 }
 
+function miniAppCityQuery(value) {
+  const city = String(value || "").trim();
+  return city.length >= 2 && city.length <= 100 && !/[\r\n\u0000]/.test(city) ? city : null;
+}
+
+function miniAppRounded(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.round(number) : null;
+}
+
+async function getMiniAppWeather(cityQuery) {
+  const city = await findCity(cityQuery, "ru");
+  if (!city) return null;
+
+  const weather = await getWeather(city);
+  const observedCurrent = await getObservedCurrent(city).catch(() => null);
+  const current = observedCurrent || weather.current;
+  const currentCode = Number.isFinite(Number(current.weather_code))
+    ? Number(current.weather_code)
+    : Number(weather.current.weather_code);
+  const days = [0, 1].map((index) => {
+    if (!weather.daily.time?.[index]) return null;
+    const code = Number(weather.daily.weather_code?.[index]);
+    const precipitation = miniAppRounded(weather.daily.precipitation_probability_max?.[index]);
+    return {
+      date: weather.daily.time[index],
+      emoji: weatherEmoji(code),
+      description: describeWeatherCode(code, "ru"),
+      min: miniAppRounded(weather.daily.temperature_2m_min?.[index]),
+      max: miniAppRounded(weather.daily.temperature_2m_max?.[index]),
+      precipitation
+    };
+  }).filter(Boolean);
+
+  return {
+    city: formatCityName(city),
+    timezone: weather.timezone,
+    current: {
+      emoji: weatherEmoji(currentCode),
+      description: observedCurrent?.description || describeWeatherCode(currentCode, "ru"),
+      temperature: miniAppRounded(current.temperature_2m),
+      apparent: miniAppRounded(current.apparent_temperature),
+      wind: miniAppRounded(current.wind_speed_10m)
+    },
+    days
+  };
+}
+
 async function handleMiniAppRequest(req, res, requestUrl) {
   if (req.method !== "GET") return false;
 
@@ -2792,6 +2970,27 @@ async function handleMiniAppRequest(req, res, requestUrl) {
     res.writeHead(200, securityHeaders("text/html; charset=utf-8"));
     res.end(miniAppHtml());
     return true;
+  }
+
+  if (requestUrl.pathname === "/api/weather") {
+    const cityQuery = miniAppCityQuery(requestUrl.searchParams.get("city"));
+    if (!cityQuery) {
+      miniAppError(res, 400, "Invalid city");
+      return true;
+    }
+    try {
+      const weather = await getMiniAppWeather(cityQuery);
+      if (!weather) {
+        miniAppError(res, 404, "City not found");
+        return true;
+      }
+      sendJson(res, 200, { ok: true, weather });
+      return true;
+    } catch (error) {
+      console.error("Mini App weather error:", error.message);
+      miniAppError(res, 502, "Weather service is unavailable");
+      return true;
+    }
   }
 
   if (!requestUrl.pathname.startsWith("/api/transport/")) return false;
@@ -2940,6 +3139,7 @@ function startWebhookServer() {
     if (baseUrl) {
       try {
         await configureWebhook(baseUrl);
+        await configureMiniAppMenuButton();
         await logTelegramBotIdentity();
         await logWebhookStatus();
       } catch (error) {
