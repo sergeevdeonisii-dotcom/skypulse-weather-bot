@@ -5,6 +5,7 @@ const path = require("path");
 const zlib = require("zlib");
 const crypto = require("crypto");
 const { configuredWeekendServiceDates, serviceDayForDateParts } = require("./transport-calendar");
+const { buildTransitOptions, prepareTransitNetwork } = require("./trip-planner");
 
 const envPath = path.join(__dirname, ".env");
 if (fs.existsSync(envPath)) {
@@ -46,7 +47,15 @@ const MINI_APP_API_WINDOW_MS = 60 * 1000;
 const MINI_APP_API_MAX_REQUESTS = 90;
 const MINI_APP_AI_WINDOW_MS = 60 * 1000;
 const MINI_APP_AI_MAX_REQUESTS = 8;
+const MINI_APP_TRIP_WINDOW_MS = 60 * 1000;
+const MINI_APP_TRIP_MAX_REQUESTS = 4;
 const MINI_APP_INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60;
+const NOMINATIM_MIN_INTERVAL_MS = 1100;
+const NOMINATIM_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
+const OSM_NETWORK_CACHE_MS = 12 * 60 * 60 * 1000;
+const OSM_OVERPASS_URL = process.env.OSM_OVERPASS_URL || "https://maps.mail.ru/osm/tools/overpass/api/interpreter";
+const OSM_NOMINATIM_URL = process.env.OSM_NOMINATIM_URL || "https://nominatim.openstreetmap.org/search";
+const OSM_USER_AGENT = "SkyPulseWeatherBot/1.0 (https://t.me/SkyPulseWeatherBot)";
 const PREFERENCES_FILE = process.env.PREFERENCES_FILE || path.join(__dirname, "data", "user-preferences.json");
 
 const userSessions = new Map();
@@ -55,6 +64,7 @@ const lastClothingAdvice = new Map();
 const rateBuckets = new Map();
 const miniAppApiRateBuckets = new Map();
 const miniAppAiRateBuckets = new Map();
+const miniAppTripRateBuckets = new Map();
 const userPreferences = new Map();
 const transportCache = {
   routes: { value: null, expiresAt: 0 },
@@ -64,8 +74,14 @@ const transportCache = {
   stopPages: new Map()
 };
 const callbackStore = new Map();
+const tripPlannerCache = {
+  geocodes: new Map(),
+  osmNetwork: { value: null, expiresAt: 0 }
+};
 let offset = 0;
 let lastStateCleanupAt = 0;
+let nominatimQueue = Promise.resolve();
+let nextNominatimRequestAt = 0;
 
 process.on("unhandledRejection", (error) => {
   console.error("Unhandled rejection:", error?.message || error);
@@ -79,9 +95,9 @@ function securityHeaders(contentType = "text/plain; charset=utf-8") {
   return {
     "Content-Type": contentType,
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-    "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org; form-action 'self'",
+    "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' https://telegram.org https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org; form-action 'self'",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
     "Cache-Control": "no-store"
   };
@@ -167,6 +183,17 @@ function isMiniAppAiRateLimited(req, authorization) {
   return fresh.length > MINI_APP_AI_MAX_REQUESTS;
 }
 
+function isMiniAppTripRateLimited(req, authorization) {
+  const now = Date.now();
+  cleanupRuntimeState(now);
+  const key = miniAppClientKey(req, authorization);
+  const bucket = miniAppTripRateBuckets.get(key) || [];
+  const fresh = bucket.filter((time) => now - time < MINI_APP_TRIP_WINDOW_MS);
+  fresh.push(now);
+  miniAppTripRateBuckets.set(key, fresh);
+  return fresh.length > MINI_APP_TRIP_MAX_REQUESTS;
+}
+
 function cleanupCallbackStore() {
   const now = Date.now();
   for (const [token, payload] of callbackStore.entries()) {
@@ -205,6 +232,15 @@ function cleanupRuntimeState(now = Date.now()) {
     }
   }
 
+  for (const [key, bucket] of miniAppTripRateBuckets.entries()) {
+    const fresh = bucket.filter((time) => now - time < MINI_APP_TRIP_WINDOW_MS);
+    if (fresh.length) {
+      miniAppTripRateBuckets.set(key, fresh);
+    } else {
+      miniAppTripRateBuckets.delete(key);
+    }
+  }
+
   cleanupCallbackStore();
 
   for (const [chatId, session] of userSessions.entries()) {
@@ -229,6 +265,10 @@ function cleanupRuntimeState(now = Date.now()) {
 
   for (const [key, cached] of transportCache.stopPages.entries()) {
     if (!cached?.expiresAt || cached.expiresAt < now) transportCache.stopPages.delete(key);
+  }
+
+  for (const [key, cached] of tripPlannerCache.geocodes.entries()) {
+    if (!cached?.expiresAt || cached.expiresAt < now) tripPlannerCache.geocodes.delete(key);
   }
 }
 
@@ -2985,6 +3025,8 @@ function miniAppHtml() {
   <meta name="color-scheme" content="light dark">
   <title>Расписание Гродно</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <style>
     :root {
       color-scheme: light dark;
@@ -3040,6 +3082,16 @@ function miniAppHtml() {
     .departure-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
     .departure { padding: 6px 8px; border: 1px solid var(--border); border-radius: 9px; font-variant-numeric: tabular-nums; font-size: 14px; }
     .departure strong { display: block; }
+    .trip-form { display: grid; gap: 9px; margin-top: 12px; }
+    .trip-form button { width: 100%; }
+    .trip-result { display: grid; gap: 10px; margin-top: 12px; }
+    .trip-option { padding: 12px; border: 1px solid var(--border); border-radius: 13px; }
+    .trip-option:first-child { border-color: var(--accent); }
+    .trip-option strong { display: block; }
+    .trip-option p { margin-top: 7px; }
+    .trip-leg { padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--border); }
+    #trip-map { height: 280px; margin-top: 12px; border: 1px solid var(--border); border-radius: 13px; overflow: hidden; background: var(--card); }
+    .leaflet-container { font: 14px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     [hidden] { display: none !important; }
     @media (max-width: 430px) { .assistant-form { grid-template-columns: 1fr; } }
     @media (max-width: 360px) { .route-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } .schedule-grid, .forecast-days { grid-template-columns: 1fr; } }
@@ -3082,6 +3134,19 @@ function miniAppHtml() {
       <h1>🚌 Расписание Гродно</h1>
       <p class="muted">Выбери маршрут и остановку — покажем время в будни и выходные.</p>
     </header>
+
+    <section class="card">
+      <strong>🧭 Построить поездку</strong>
+      <p class="muted">Укажи адреса в Гродно. Покажем быстрые варианты, пересадки, нужные остановки и путь на карте.</p>
+      <form id="trip-form" class="trip-form">
+        <input id="trip-from" type="search" maxlength="160" autocomplete="street-address" placeholder="Откуда: например, Советская 8" aria-label="Адрес отправления">
+        <input id="trip-to" type="search" maxlength="160" autocomplete="street-address" placeholder="Куда: например, ТРК Тринити" aria-label="Адрес назначения">
+        <button class="primary" type="submit">Построить маршрут</button>
+      </form>
+      <div id="trip-notice" class="notice" role="status"></div>
+      <div id="trip-result" class="trip-result" hidden></div>
+      <div id="trip-map" hidden aria-label="Карта поездки"></div>
+    </section>
 
     <section class="card assistant-card">
       <strong>🤖 Умный поиск по остановке</strong>
@@ -3168,6 +3233,14 @@ function miniAppHtml() {
       var assistantQuery = document.getElementById("assistant-query");
       var assistantNotice = document.getElementById("assistant-notice");
       var assistantResult = document.getElementById("assistant-result");
+      var tripForm = document.getElementById("trip-form");
+      var tripFrom = document.getElementById("trip-from");
+      var tripTo = document.getElementById("trip-to");
+      var tripNotice = document.getElementById("trip-notice");
+      var tripResult = document.getElementById("trip-result");
+      var tripMapElement = document.getElementById("trip-map");
+      var tripMapInstance = null;
+      var tripMapLayers = null;
       var transportLoaded = false;
 
       function setNotice(text, isError) {
@@ -3204,6 +3277,11 @@ function miniAppHtml() {
       function setAssistantNotice(text, isError) {
         assistantNotice.textContent = text || "";
         assistantNotice.className = isError ? "notice error" : "notice";
+      }
+
+      function setTripNotice(text, isError) {
+        tripNotice.textContent = text || "";
+        tripNotice.className = isError ? "notice error" : "notice";
       }
 
       function switchSection(section) {
@@ -3298,6 +3376,140 @@ function miniAppHtml() {
           assistantResult.appendChild(block);
         });
         assistantResult.hidden = false;
+      }
+
+      function tripDistanceText(meters) {
+        var value = Math.max(0, Number(meters) || 0);
+        if (value < 1000) return String(Math.round(value / 10) * 10) + " м";
+        return (Math.round(value / 100) / 10).toFixed(1).replace(".0", "") + " км";
+      }
+
+      function tripTransportIcon(type) {
+        return type === "Tb" ? "🚎" : "🚌";
+      }
+
+      function tripLegText(leg) {
+        return tripTransportIcon(leg.type) + " " + (leg.type === "Tb" ? "Троллейбус " : "Автобус ")
+          + String(leg.num) + ": с остановки «" + String(leg.fromStop.name) + "» до «"
+          + String(leg.toStop.name) + "» — " + String(leg.stopsCount) + " "
+          + (Number(leg.stopsCount) === 1 ? "остановка" : "остановок") + ", ≈ "
+          + String(leg.rideMinutes) + " мин.";
+      }
+
+      function clearTripMap() {
+        if (tripMapLayers) tripMapLayers.clearLayers();
+        tripMapElement.hidden = true;
+      }
+
+      function drawTripMarker(point, label, color, bounds) {
+        if (!point || !Number.isFinite(Number(point.lat)) || !Number.isFinite(Number(point.lon))) return;
+        var coordinates = [Number(point.lat), Number(point.lon)];
+        window.L.circleMarker(coordinates, {
+          radius: 8,
+          color: color,
+          fillColor: color,
+          fillOpacity: 0.95,
+          weight: 2
+        }).bindTooltip(label).addTo(tripMapLayers);
+        bounds.push(coordinates);
+      }
+
+      function renderTripMap(plan) {
+        if (!window.L || !plan || !plan.options || !plan.options.length) {
+          clearTripMap();
+          return;
+        }
+        tripMapElement.hidden = false;
+        if (!tripMapInstance) {
+          tripMapInstance = window.L.map(tripMapElement, { scrollWheelZoom: false, zoomControl: true });
+          window.L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors"
+          }).addTo(tripMapInstance);
+          tripMapLayers = window.L.layerGroup().addTo(tripMapInstance);
+        } else {
+          tripMapLayers.clearLayers();
+        }
+
+        var bounds = [];
+        drawTripMarker(plan.origin, "Старт", "#2d8cff", bounds);
+        drawTripMarker(plan.destination, "Финиш", "#31a45b", bounds);
+        var best = plan.options[0];
+        (best.legs || []).forEach(function (leg, index) {
+          var line = (leg.geometry || []).map(function (point) {
+            return [Number(point.lat), Number(point.lon)];
+          }).filter(function (point) {
+            return Number.isFinite(point[0]) && Number.isFinite(point[1]);
+          });
+          if (line.length < 2) return;
+          line.forEach(function (point) { bounds.push(point); });
+          window.L.polyline(line, {
+            color: index ? "#7a5cff" : "#2d8cff",
+            weight: 5,
+            opacity: 0.82
+          }).addTo(tripMapLayers);
+        });
+        if (bounds.length) tripMapInstance.fitBounds(bounds, { padding: [24, 24], maxZoom: 15 });
+        window.setTimeout(function () { tripMapInstance.invalidateSize(); }, 0);
+      }
+
+      function renderTripPlan(plan) {
+        tripResult.replaceChildren();
+        if (!plan || plan.kind !== "result") {
+          var notFound = document.createElement("strong");
+          notFound.textContent = (plan && plan.message) || "Не получилось построить маршрут.";
+          tripResult.appendChild(notFound);
+          tripResult.hidden = false;
+          clearTripMap();
+          return;
+        }
+
+        var heading = document.createElement("strong");
+        heading.textContent = "Маршруты: " + String(plan.origin.name) + " → " + String(plan.destination.name);
+        tripResult.appendChild(heading);
+        var note = document.createElement("p");
+        note.className = "muted";
+        note.textContent = plan.message || "Время ориентировочное.";
+        tripResult.appendChild(note);
+
+        (plan.options || []).forEach(function (option, optionIndex) {
+          var card = document.createElement("div");
+          card.className = "trip-option";
+          var title = document.createElement("strong");
+          title.textContent = optionIndex === 0
+            ? "Самый быстрый · ≈ " + String(option.estimatedMinutes) + " мин"
+            : "Вариант " + String(optionIndex + 1) + " · ≈ " + String(option.estimatedMinutes) + " мин";
+          var details = document.createElement("p");
+          details.className = "muted";
+          var transfers = Number(option.transfers) || 0;
+          var walking = (Number(option.walkToMeters) || 0) + (Number(option.walkFromMeters) || 0)
+            + (Number(option.transferWalkMeters) || 0);
+          details.textContent = (transfers ? String(transfers) + " пересадка" + (transfers > 1 ? "и" : "") : "Без пересадок")
+            + " · пешком ≈ " + tripDistanceText(walking);
+          card.appendChild(title);
+          card.appendChild(details);
+
+          (option.legs || []).forEach(function (leg, legIndex) {
+            if (legIndex > 0 && option.transferStop) {
+              var transfer = document.createElement("p");
+              transfer.className = "muted";
+              transfer.textContent = "Пересадка у остановки «" + String(option.transferStop.name) + "»"
+                + ((Number(option.transferWalkMeters) || 0) ? ", пешком " + tripDistanceText(option.transferWalkMeters) : "") + ".";
+              card.appendChild(transfer);
+            }
+            var legBlock = document.createElement("div");
+            legBlock.className = "trip-leg";
+            legBlock.textContent = tripLegText(leg);
+            card.appendChild(legBlock);
+          });
+          tripResult.appendChild(card);
+        });
+        var mapNote = document.createElement("p");
+        mapNote.className = "muted";
+        mapNote.textContent = "На карте — самый быстрый вариант.";
+        tripResult.appendChild(mapNote);
+        tripResult.hidden = false;
+        renderTripMap(plan);
       }
 
       function loadWeather(city) {
@@ -3444,6 +3656,26 @@ function miniAppHtml() {
         clothingCard.hidden = !clothingCard.hidden;
         clothingToggle.setAttribute("aria-expanded", clothingCard.hidden ? "false" : "true");
       });
+      tripForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var from = String(tripFrom.value || "").trim();
+        var to = String(tripTo.value || "").trim();
+        if (from.length < 3 || to.length < 3) {
+          setTripNotice("Напиши адрес отправления и адрес назначения точнее.", true);
+          return;
+        }
+        tripResult.hidden = true;
+        clearTripMap();
+        setTripNotice("Ищу адреса, остановки и варианты поездки… Первый поиск может занять немного дольше.", false);
+        postJson("/api/trip-plan", { from: from, to: to }).then(function (data) {
+          renderTripPlan(data.plan || {});
+          setTripNotice("", false);
+        }).catch(function () {
+          tripResult.hidden = true;
+          clearTripMap();
+          setTripNotice("Не удалось построить маршрут сейчас. Проверь адреса и попробуй ещё раз чуть позже.", true);
+        });
+      });
       assistantForm.addEventListener("submit", function (event) {
         event.preventDefault();
         var query = String(assistantQuery.value || "").trim();
@@ -3560,6 +3792,173 @@ async function getMiniAppWeather(cityQuery) {
   };
 }
 
+function miniAppTripLocation(value) {
+  const location = String(value || "").trim().replace(/\s+/g, " ");
+  return location.length >= 3 && location.length <= 160 && !/[\r\n\u0000]/.test(location) ? location : null;
+}
+
+function waitFor(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isInsideGrodno(point) {
+  return Number(point?.lat) >= 53.60 && Number(point?.lat) <= 53.82
+    && Number(point?.lon) >= 23.55 && Number(point?.lon) <= 24.05;
+}
+
+async function queuedNominatimSearch(url) {
+  const previous = nominatimQueue.catch(() => {});
+  const task = previous.then(async () => {
+    const waitMs = Math.max(0, nextNominatimRequestAt - Date.now());
+    if (waitMs) await waitFor(waitMs);
+    nextNominatimRequestAt = Date.now() + NOMINATIM_MIN_INTERVAL_MS;
+    return fetchJson(url, {
+      timeoutMs: 12000,
+      maxBytes: 256 * 1024,
+      label: "Address search",
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": OSM_USER_AGENT
+      }
+    });
+  });
+  nominatimQueue = task.catch(() => {});
+  return task;
+}
+
+async function geocodeGrodnoAddress(query) {
+  const normalized = String(query).trim().toLowerCase();
+  const cached = tripPlannerCache.geocodes.get(normalized);
+  if (cached?.expiresAt > Date.now()) return cached.value;
+
+  const url = new URL(OSM_NOMINATIM_URL);
+  url.searchParams.set("format", "jsonv2");
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("addressdetails", "1");
+  url.searchParams.set("countrycodes", "by");
+  url.searchParams.set("bounded", "1");
+  url.searchParams.set("viewbox", "23.55,53.82,24.05,53.60");
+  url.searchParams.set("q", `${query}, Гродно, Беларусь`);
+  const rows = await queuedNominatimSearch(url.toString());
+  const row = Array.isArray(rows) ? rows.find((item) => isInsideGrodno({ lat: Number(item?.lat), lon: Number(item?.lon) })) : null;
+  if (!row) return null;
+
+  const value = {
+    name: String(row.display_name || query).split(",").slice(0, 3).join(", "),
+    lat: Number(row.lat),
+    lon: Number(row.lon)
+  };
+  tripPlannerCache.geocodes.set(normalized, { value, expiresAt: Date.now() + NOMINATIM_CACHE_MS });
+  return value;
+}
+
+function parseOsmTransitNetwork(data) {
+  const elements = Array.isArray(data?.elements) ? data.elements : [];
+  const nodes = new Map(elements
+    .filter((item) => item?.type === "node" && Number.isFinite(Number(item.lat)) && Number.isFinite(Number(item.lon)))
+    .map((item) => [String(item.id), item]));
+  const seenRoutes = new Set();
+  const routes = [];
+
+  for (const relation of elements.filter((item) => item?.type === "relation")) {
+    const tags = relation.tags || {};
+    const routeKind = String(tags.route || "");
+    if (routeKind !== "bus" && routeKind !== "trolleybus") continue;
+    const title = String(tags["name:ru"] || tags.name || "");
+    if (/маршрутн(?:ое|ая)?\s+такси/i.test(title)) continue;
+    const num = String(tags.ref || "").trim();
+    if (!/^[0-9]{1,3}[A-Za-zА-Яа-я]?$/u.test(num)) continue;
+    const members = Array.isArray(relation.members) ? relation.members : [];
+    let platformMembers = members.filter((member) => member?.type === "node" && member.role === "platform");
+    if (platformMembers.length < 2) {
+      platformMembers = members.filter((member) => member?.type === "node" && member.role === "stop");
+    }
+    const stops = platformMembers.map((member) => {
+      const node = nodes.get(String(member.ref));
+      if (!node) return null;
+      return {
+        id: String(node.id),
+        name: String(node.tags?.["name:ru"] || node.tags?.name || node.tags?.["name:be"] || "Остановка"),
+        lat: Number(node.lat),
+        lon: Number(node.lon)
+      };
+    }).filter(Boolean);
+    if (stops.length < 2) continue;
+    const signature = `${routeKind}:${num}:${stops.map((stop) => stop.id).join(",")}`;
+    if (seenRoutes.has(signature)) continue;
+    seenRoutes.add(signature);
+    routes.push({
+      id: `osm:${relation.id}`,
+      type: routeKind === "trolleybus" ? "Tb" : "A",
+      num,
+      title: title || `${routeKind === "trolleybus" ? "Троллейбус" : "Автобус"} ${num}`,
+      stops
+    });
+  }
+
+  const network = prepareTransitNetwork(routes);
+  if (!network.routes.length || !network.stops.length) throw new Error("OSM transit data is empty");
+  return network;
+}
+
+async function getOsmTransitNetwork() {
+  const cached = tripPlannerCache.osmNetwork;
+  if (cached.value && cached.expiresAt > Date.now()) return cached.value;
+
+  const query = [
+    "[out:json][timeout:55];",
+    "relation[\"type\"=\"route\"][\"route\"~\"^(bus|trolleybus)$\"](53.60,23.55,53.82,24.05)->.routes;",
+    "(.routes;node(r.routes););",
+    "out body;"
+  ].join("");
+  const data = await fetchJson(OSM_OVERPASS_URL, {
+    method: "POST",
+    timeoutMs: 65000,
+    maxBytes: 5 * 1024 * 1024,
+    label: "Grodno transit map",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "Accept": "application/json",
+      "User-Agent": OSM_USER_AGENT
+    },
+    body: `data=${encodeURIComponent(query)}`
+  });
+  const value = parseOsmTransitNetwork(data);
+  tripPlannerCache.osmNetwork = { value, expiresAt: Date.now() + OSM_NETWORK_CACHE_MS };
+  return value;
+}
+
+async function getMiniAppTripPlan(from, to) {
+  const [origin, destination, network] = await Promise.all([
+    geocodeGrodnoAddress(from),
+    geocodeGrodnoAddress(to),
+    getOsmTransitNetwork()
+  ]);
+  if (!origin || !destination) {
+    return {
+      kind: "not_found",
+      message: "Не нашёл один из адресов в пределах Гродно. Напиши улицу и номер дома точнее."
+    };
+  }
+
+  const result = buildTransitOptions(network, origin, destination);
+  if (!result.options.length) {
+    return {
+      kind: "not_found",
+      origin,
+      destination,
+      message: "Не получилось подобрать путь с одной пересадкой. Попробуй указать адреса точнее или выбери ближайший ориентир."
+    };
+  }
+  return {
+    kind: "result",
+    origin,
+    destination,
+    options: result.options,
+    message: "Время ориентировочное: учитывает пеший путь, среднее время между остановками и обычное ожидание транспорта."
+  };
+}
+
 async function handleMiniAppRequest(req, res, requestUrl) {
   const isMiniAppApi = requestUrl.pathname.startsWith("/api/");
   const authorization = isMiniAppApi ? miniAppAuthorization(req) : null;
@@ -3603,6 +4002,42 @@ async function handleMiniAppRequest(req, res, requestUrl) {
     } catch (error) {
       console.error("Mini App AI transport error:", error.message);
       miniAppError(res, 502, "Transport service is unavailable");
+    }
+    return true;
+  }
+
+  if (requestUrl.pathname === "/api/trip-plan") {
+    if (req.method !== "POST") {
+      miniAppError(res, 405, "Method not allowed");
+      return true;
+    }
+    if (isMiniAppTripRateLimited(req, authorization)) {
+      miniAppError(res, 429, "Too many route searches. Please wait a minute.");
+      return true;
+    }
+
+    let payload;
+    try {
+      const body = await readRequestBody(req, 16 * 1024);
+      payload = JSON.parse(body);
+    } catch (error) {
+      miniAppError(res, error?.message === "Request body too large" ? 413 : 400, "Invalid request");
+      return true;
+    }
+
+    const from = miniAppTripLocation(payload?.from);
+    const to = miniAppTripLocation(payload?.to);
+    if (!from || !to) {
+      miniAppError(res, 400, "Invalid route locations");
+      return true;
+    }
+
+    try {
+      const plan = await getMiniAppTripPlan(from, to);
+      sendJson(res, 200, { ok: true, plan });
+    } catch (error) {
+      console.error("Mini App trip planner error:", error.message);
+      miniAppError(res, 502, "Trip planner is unavailable");
     }
     return true;
   }

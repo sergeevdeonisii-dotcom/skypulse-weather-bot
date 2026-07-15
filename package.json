@@ -5,7 +5,7 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "check": "node --check bot.js && node --check transport-calendar.js",
+    "check": "node --check bot.js && node --check transport-calendar.js && node --check trip-planner.js",
     "test": "node --test"
   },
   "keywords": [
