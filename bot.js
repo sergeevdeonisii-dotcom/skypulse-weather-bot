@@ -3424,7 +3424,7 @@ function miniAppHtml() {
           tripMapInstance = window.L.map(tripMapElement, { scrollWheelZoom: false, zoomControl: true });
           window.L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
             maxZoom: 19,
-            attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors"
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
           }).addTo(tripMapInstance);
           tripMapLayers = window.L.layerGroup().addTo(tripMapInstance);
         } else {
