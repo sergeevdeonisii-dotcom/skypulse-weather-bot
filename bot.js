@@ -27,6 +27,7 @@ const WEBHOOK_PATH = `/telegram${WEBHOOK_SECRET ? `/${WEBHOOK_SECRET}` : ""}`;
 const MINI_APP_PATH = "/transport";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GEMINI_TOKEN || process.env.GEMINI_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MINI_APP_ALLOW_LOCAL_UNVERIFIED = process.env.MINI_APP_ALLOW_LOCAL_UNVERIFIED === "true";
 const GRODNO_TIME_ZONE = "Europe/Minsk";
 const MAX_MESSAGE_TEXT_LENGTH = 160;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -130,7 +131,9 @@ function validateMiniAppInitData(rawInitData) {
 }
 
 function miniAppAuthorization(req) {
-  if (isLocalRequest(req)) return { key: `local:${req.socket?.remoteAddress || "unknown"}` };
+  if (MINI_APP_ALLOW_LOCAL_UNVERIFIED && isLocalRequest(req)) {
+    return { key: `local:${req.socket?.remoteAddress || "unknown"}` };
+  }
   return validateMiniAppInitData(String(req.headers["x-telegram-init-data"] || ""));
 }
 
