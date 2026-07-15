@@ -24,6 +24,7 @@ const TELEGRAM_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : ""
 const PORT = Number(process.env.PORT || 0);
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const WEBHOOK_PATH = `/telegram${WEBHOOK_SECRET ? `/${WEBHOOK_SECRET}` : ""}`;
+const MINI_APP_PATH = "/transport";
 const MAX_MESSAGE_TEXT_LENGTH = 160;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_MESSAGES = 18;
@@ -346,12 +347,26 @@ function toggleFavoriteRoute(chatId, type, num) {
 
 loadUserPreferences();
 
+function getMiniAppUrl() {
+  const configuredUrl = String(process.env.WEB_APP_URL || "").trim().replace(/\/$/, "");
+  const baseUrl = configuredUrl || getWebhookBaseUrl();
+  return baseUrl ? `${baseUrl}${MINI_APP_PATH}` : "";
+}
+
+function transportMiniAppButton(lang) {
+  const text = lang === "en" ? "🚌 Timetable" : "🚌 Расписание";
+  const url = getMiniAppUrl();
+  return url
+    ? { text, web_app: { url } }
+    : { text, callback_data: "transport_menu" };
+}
+
 function menuKeyboard(lang) {
   return {
     inline_keyboard: [
       [
         { text: lang === "en" ? "🌤️ Weather" : "🌤️ Погода", callback_data: "weather_menu" },
-        { text: lang === "en" ? "🚌 Transport" : "🚌 Транспорт", callback_data: "transport_menu" }
+        transportMiniAppButton(lang)
       ],
       [
         { text: LABELS[lang].help, callback_data: "help" },
@@ -378,6 +393,7 @@ function weatherMenuKeyboard(lang) {
 function transportMenuKeyboard(lang) {
   return {
     inline_keyboard: [
+      [transportMiniAppButton(lang)],
       [{ text: lang === "en" ? "🚏 Find a stop" : "🚏 Найти остановку", callback_data: "tr:stop_search" }],
       [
         { text: lang === "en" ? "🚌 Buses" : "🚌 Автобусы", callback_data: "tr:type:A" },
@@ -2504,10 +2520,364 @@ function readRequestBody(req, maxBytes = 1024 * 1024) {
   });
 }
 
+function sendJson(res, statusCode, value) {
+  res.writeHead(statusCode, securityHeaders("application/json; charset=utf-8"));
+  res.end(JSON.stringify(value));
+}
+
+function miniAppError(res, statusCode, message) {
+  sendJson(res, statusCode, { ok: false, error: message });
+}
+
+function miniAppHtml() {
+  return `<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Расписание Гродно</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--tg-theme-bg-color, #f5f7fb);
+      --card: var(--tg-theme-secondary-bg-color, #ffffff);
+      --text: var(--tg-theme-text-color, #172033);
+      --hint: var(--tg-theme-hint-color, #6e7787);
+      --accent: var(--tg-theme-button-color, #2888e8);
+      --accent-text: var(--tg-theme-button-text-color, #ffffff);
+      --border: color-mix(in srgb, var(--hint) 22%, transparent);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(100%, 720px); margin: 0 auto; padding: 20px 16px calc(28px + env(safe-area-inset-bottom)); }
+    h1 { margin: 0; font-size: 25px; letter-spacing: -.35px; }
+    h2 { margin: 22px 0 10px; font-size: 18px; }
+    p { margin: 5px 0 0; }
+    .muted { color: var(--hint); font-size: 14px; }
+    .tabs, .route-grid { display: grid; gap: 9px; }
+    .tabs { grid-template-columns: 1fr 1fr; margin-top: 20px; }
+    .route-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    button { appearance: none; border: 1px solid var(--border); border-radius: 13px; background: var(--card); color: var(--text); padding: 12px 10px; font: inherit; font-weight: 650; cursor: pointer; min-height: 46px; }
+    button:active { opacity: .72; transform: scale(.985); }
+    button.selected, button.primary { border-color: var(--accent); background: var(--accent); color: var(--accent-text); }
+    button.route { padding: 9px 3px; min-height: 42px; border-radius: 11px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px; margin-top: 14px; }
+    .direction { width: 100%; text-align: left; margin-top: 9px; }
+    .stop-list { display: grid; gap: 7px; margin-top: 10px; }
+    .stop { width: 100%; text-align: left; font-weight: 500; }
+    .stop span { color: var(--hint); display: inline-block; min-width: 28px; font-variant-numeric: tabular-nums; }
+    .back { background: transparent; border: 0; color: var(--accent); padding: 0; min-height: 26px; font-weight: 650; }
+    .schedule-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .schedule-title { margin: 0 0 6px; font-weight: 750; }
+    .schedule-line { padding: 5px 0; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+    .notice { min-height: 21px; margin-top: 13px; color: var(--hint); font-size: 14px; }
+    .notice.error { color: #d84f4f; }
+    [hidden] { display: none !important; }
+    @media (max-width: 360px) { .route-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } .schedule-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>🚌 Расписание Гродно</h1>
+      <p class="muted">Выбери маршрут и остановку — покажем время в будни и выходные.</p>
+    </header>
+
+    <section class="tabs" aria-label="Тип транспорта">
+      <button class="selected" type="button" data-type="A">🚌 Автобусы</button>
+      <button type="button" data-type="Tb">🚎 Троллейбусы</button>
+    </section>
+    <div id="notice" class="notice" role="status"></div>
+
+    <section id="routes-section">
+      <h2 id="routes-heading">Автобусные маршруты</h2>
+      <div id="routes" class="route-grid" aria-live="polite"></div>
+    </section>
+
+    <section id="route-section" hidden>
+      <button id="route-back" class="back" type="button">← К маршрутам</button>
+      <div class="card">
+        <strong id="route-title"></strong>
+        <p class="muted">Выбери направление, затем остановку.</p>
+        <div id="directions"></div>
+      </div>
+    </section>
+
+    <section id="schedule-section" hidden>
+      <button id="schedule-back" class="back" type="button">← К остановкам</button>
+      <div class="card">
+        <strong id="schedule-title"></strong>
+        <p id="schedule-direction" class="muted"></p>
+        <div class="schedule-grid">
+          <div><p class="schedule-title">Будни</p><div id="weekdays"></div></div>
+          <div><p class="schedule-title">Выходные</p><div id="weekend"></div></div>
+        </div>
+        <p class="muted">* — в гараж</p>
+      </div>
+    </section>
+  </main>
+  <script>
+    (function () {
+      var telegram = window.Telegram && window.Telegram.WebApp;
+      if (telegram) { telegram.ready(); telegram.expand(); }
+
+      var state = { type: "A", route: null };
+      var tabs = Array.prototype.slice.call(document.querySelectorAll("[data-type]"));
+      var notice = document.getElementById("notice");
+      var routes = document.getElementById("routes");
+      var routesHeading = document.getElementById("routes-heading");
+      var routeSection = document.getElementById("route-section");
+      var routeTitle = document.getElementById("route-title");
+      var directions = document.getElementById("directions");
+      var scheduleSection = document.getElementById("schedule-section");
+      var scheduleTitle = document.getElementById("schedule-title");
+      var scheduleDirection = document.getElementById("schedule-direction");
+      var weekdays = document.getElementById("weekdays");
+      var weekend = document.getElementById("weekend");
+
+      function setNotice(text, isError) {
+        notice.textContent = text || "";
+        notice.className = isError ? "notice error" : "notice";
+      }
+
+      function request(path) {
+        return fetch(path, { headers: { Accept: "application/json" } }).then(function (response) {
+          if (!response.ok) throw new Error("request failed");
+          return response.json();
+        }).then(function (body) {
+          if (!body || body.ok !== true) throw new Error("invalid response");
+          return body;
+        });
+      }
+
+      function makeButton(text, className) {
+        var button = document.createElement("button");
+        button.type = "button";
+        button.textContent = text;
+        if (className) button.className = className;
+        return button;
+      }
+
+      function showRoutes() {
+        routeSection.hidden = true;
+        scheduleSection.hidden = true;
+      }
+
+      function renderStops(direction, directionIndex) {
+        var list = document.createElement("div");
+        list.className = "stop-list";
+        direction.stops.forEach(function (stop) {
+          var button = makeButton("", "stop");
+          var number = document.createElement("span");
+          number.textContent = String(stop.index + 1) + ".";
+          button.appendChild(number);
+          button.appendChild(document.createTextNode(stop.name));
+          button.addEventListener("click", function () { loadSchedule(directionIndex, stop.index); });
+          list.appendChild(button);
+        });
+        return list;
+      }
+
+      function renderRoute(route) {
+        state.route = route;
+        routeTitle.textContent = route.title;
+        directions.replaceChildren();
+        route.directions.forEach(function (direction, directionIndex) {
+          var wrap = document.createElement("div");
+          var button = makeButton(direction.title || "Направление " + String(directionIndex + 1), "direction");
+          var stops = renderStops(direction, directionIndex);
+          stops.hidden = true;
+          button.addEventListener("click", function () {
+            var wasHidden = stops.hidden;
+            Array.prototype.slice.call(directions.querySelectorAll(".stop-list")).forEach(function (item) { item.hidden = true; });
+            stops.hidden = !wasHidden;
+          });
+          wrap.appendChild(button);
+          wrap.appendChild(stops);
+          directions.appendChild(wrap);
+        });
+        showRoutes();
+        routeSection.hidden = false;
+      }
+
+      function renderScheduleLines(container, lines) {
+        container.replaceChildren();
+        (lines.length ? lines : ["Нет рейсов"]).forEach(function (line) {
+          var item = document.createElement("div");
+          item.className = "schedule-line";
+          item.textContent = line;
+          container.appendChild(item);
+        });
+      }
+
+      function loadSchedule(directionIndex, stopIndex) {
+        if (!state.route) return;
+        setNotice("Загружаю расписание…", false);
+        var path = "/api/transport/schedule?type=" + encodeURIComponent(state.type) + "&num=" + encodeURIComponent(state.route.num) + "&direction=" + encodeURIComponent(directionIndex) + "&stop=" + encodeURIComponent(stopIndex);
+        request(path).then(function (data) {
+          scheduleTitle.textContent = data.schedule.title || data.schedule.stopName || "Расписание";
+          scheduleDirection.textContent = data.schedule.direction || "";
+          renderScheduleLines(weekdays, data.schedule.weekdays || []);
+          renderScheduleLines(weekend, data.schedule.weekend || []);
+          scheduleSection.hidden = false;
+          routeSection.hidden = true;
+          setNotice("", false);
+        }).catch(function () {
+          setNotice("Не получилось загрузить расписание. Попробуй ещё раз.", true);
+        });
+      }
+
+      function loadRoute(num) {
+        setNotice("Загружаю остановки…", false);
+        request("/api/transport/route?type=" + encodeURIComponent(state.type) + "&num=" + encodeURIComponent(num)).then(function (data) {
+          if (!data.route.directions || !data.route.directions.length) throw new Error("empty route");
+          renderRoute(data.route);
+          setNotice("", false);
+        }).catch(function () {
+          setNotice("Не получилось загрузить остановки маршрута. Попробуй ещё раз.", true);
+        });
+      }
+
+      function loadRoutes(type) {
+        state.type = type;
+        state.route = null;
+        showRoutes();
+        tabs.forEach(function (tab) { tab.classList.toggle("selected", tab.dataset.type === type); });
+        routesHeading.textContent = type === "A" ? "Автобусные маршруты" : "Троллейбусные маршруты";
+        routes.replaceChildren();
+        setNotice("Загружаю маршруты…", false);
+        request("/api/transport/routes?type=" + encodeURIComponent(type)).then(function (data) {
+          data.routes.forEach(function (num) {
+            var button = makeButton(num, "route");
+            button.addEventListener("click", function () { loadRoute(num); });
+            routes.appendChild(button);
+          });
+          setNotice(data.routes.length ? "" : "Маршруты пока не найдены.", !data.routes.length);
+        }).catch(function () {
+          setNotice("Сервис расписаний сейчас не отвечает. Попробуй чуть позже.", true);
+        });
+      }
+
+      tabs.forEach(function (tab) {
+        tab.addEventListener("click", function () { loadRoutes(tab.dataset.type); });
+      });
+      document.getElementById("route-back").addEventListener("click", function () { showRoutes(); });
+      document.getElementById("schedule-back").addEventListener("click", function () {
+        scheduleSection.hidden = true;
+        routeSection.hidden = false;
+      });
+      loadRoutes("A");
+    }());
+  </script>
+</body>
+</html>`;
+}
+
+function miniAppRouteNumber(value) {
+  const number = String(value || "").trim();
+  return /^[0-9]{1,3}[A-Za-zА-Яа-я]?$/.test(number) ? number : null;
+}
+
+function miniAppIndex(value, size) {
+  const index = Number(value);
+  return Number.isInteger(index) && index >= 0 && index < size ? index : -1;
+}
+
+async function handleMiniAppRequest(req, res, requestUrl) {
+  if (req.method !== "GET") return false;
+
+  if (requestUrl.pathname === MINI_APP_PATH) {
+    res.writeHead(200, securityHeaders("text/html; charset=utf-8"));
+    res.end(miniAppHtml());
+    return true;
+  }
+
+  if (!requestUrl.pathname.startsWith("/api/transport/")) return false;
+
+  const type = normalizeTransportType(requestUrl.searchParams.get("type") || "");
+  if (!btransSlugForType(type)) {
+    miniAppError(res, 400, "Unsupported transport type");
+    return true;
+  }
+
+  try {
+    if (requestUrl.pathname === "/api/transport/routes") {
+      const routes = await getBtransRouteNumbers(type);
+      sendJson(res, 200, { ok: true, routes });
+      return true;
+    }
+
+    const num = miniAppRouteNumber(requestUrl.searchParams.get("num"));
+    if (!num) {
+      miniAppError(res, 400, "Invalid route number");
+      return true;
+    }
+
+    const route = await getBtransRoute(type, num);
+    if (!route || !route.directions.length) {
+      miniAppError(res, 404, "Route not found");
+      return true;
+    }
+
+    if (requestUrl.pathname === "/api/transport/route") {
+      sendJson(res, 200, {
+        ok: true,
+        route: {
+          title: route.title,
+          num: route.num,
+          directions: route.directions.map((direction) => ({
+            title: direction.title,
+            stops: direction.stops.slice(0, 120).map((stop, index) => ({ index, name: stop.name }))
+          }))
+        }
+      });
+      return true;
+    }
+
+    if (requestUrl.pathname === "/api/transport/schedule") {
+      const directionIndex = miniAppIndex(requestUrl.searchParams.get("direction"), route.directions.length);
+      if (directionIndex < 0) {
+        miniAppError(res, 400, "Invalid direction");
+        return true;
+      }
+      const direction = route.directions[directionIndex];
+      const stopIndex = miniAppIndex(requestUrl.searchParams.get("stop"), direction.stops.length);
+      if (stopIndex < 0) {
+        miniAppError(res, 400, "Invalid stop");
+        return true;
+      }
+      const schedule = await getBtransStopSchedule(direction.stops[stopIndex].url);
+      sendJson(res, 200, {
+        ok: true,
+        schedule: {
+          title: schedule.title,
+          stopName: schedule.stopName,
+          direction: schedule.direction,
+          weekdays: schedule.schedule.weekdays,
+          weekend: schedule.schedule.weekend
+        }
+      });
+      return true;
+    }
+
+    miniAppError(res, 404, "Not found");
+    return true;
+  } catch (error) {
+    console.error("Mini App transport error:", error.message);
+    miniAppError(res, 502, "Transport service is unavailable");
+    return true;
+  }
+}
+
 function startWebhookServer() {
   const baseUrl = getWebhookBaseUrl();
   const server = http.createServer(async (req, res) => {
     try {
+      const requestUrl = new URL(req.url || "/", "http://localhost");
+      if (await handleMiniAppRequest(req, res, requestUrl)) return;
+
       if (req.method === "GET" && (req.url === "/" || req.url === "/healthz")) {
         res.writeHead(200, securityHeaders());
         res.end("ok");
