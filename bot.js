@@ -39,14 +39,18 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 const ADVICE_TTL_MS = 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_FAVORITE_ROUTES = 12;
+const MINI_APP_API_WINDOW_MS = 60 * 1000;
+const MINI_APP_API_MAX_REQUESTS = 90;
 const MINI_APP_AI_WINDOW_MS = 60 * 1000;
 const MINI_APP_AI_MAX_REQUESTS = 8;
+const MINI_APP_INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60;
 const PREFERENCES_FILE = process.env.PREFERENCES_FILE || path.join(__dirname, "data", "user-preferences.json");
 
 const userSessions = new Map();
 const userLanguages = new Map();
 const lastClothingAdvice = new Map();
 const rateBuckets = new Map();
+const miniAppApiRateBuckets = new Map();
 const miniAppAiRateBuckets = new Map();
 const userPreferences = new Map();
 const transportCache = {
@@ -74,6 +78,8 @@ function securityHeaders(contentType = "text/plain; charset=utf-8") {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Content-Security-Policy": "default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org; form-action 'self'",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
     "Cache-Control": "no-store"
   };
 }
@@ -90,15 +96,65 @@ function isRateLimited(chatId, kind = "message") {
   return fresh.length > limit;
 }
 
-function miniAppClientKey(req) {
+function isLocalRequest(req) {
+  const address = String(req.socket?.remoteAddress || "");
+  return address === "::1" || address === "127.0.0.1" || address.startsWith("::ffff:127.");
+}
+
+function validateMiniAppInitData(rawInitData) {
+  if (!BOT_TOKEN || !rawInitData || typeof rawInitData !== "string" || rawInitData.length > 8192) return null;
+  const params = new URLSearchParams(rawInitData);
+  const providedHash = params.get("hash");
+  const authDate = Number(params.get("auth_date"));
+  if (!providedHash || !/^[a-f0-9]{64}$/i.test(providedHash) || !Number.isInteger(authDate)) return null;
+  const now = Math.floor(Date.now() / 1000);
+  if (authDate > now + 300 || now - authDate > MINI_APP_INIT_DATA_MAX_AGE_SECONDS) return null;
+
+  params.delete("hash");
+  const dataCheckString = [...params.entries()]
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+  const secret = crypto.createHmac("sha256", "WebAppData").update(BOT_TOKEN).digest();
+  const expected = crypto.createHmac("sha256", secret).update(dataCheckString).digest();
+  const received = Buffer.from(providedHash, "hex");
+  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) return null;
+
+  try {
+    const user = JSON.parse(params.get("user") || "{}");
+    if (user?.id) return { key: `telegram:${user.id}` };
+  } catch {
+    // A valid Mini App request can omit user data in some launch contexts.
+  }
+  return { key: `telegram:${params.get("query_id") || providedHash}` };
+}
+
+function miniAppAuthorization(req) {
+  if (isLocalRequest(req)) return { key: `local:${req.socket?.remoteAddress || "unknown"}` };
+  return validateMiniAppInitData(String(req.headers["x-telegram-init-data"] || ""));
+}
+
+function miniAppClientKey(req, authorization = null) {
+  if (authorization?.key) return authorization.key;
   const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
   return forwarded || req.socket?.remoteAddress || "unknown";
 }
 
-function isMiniAppAiRateLimited(req) {
+function isMiniAppApiRateLimited(req, authorization) {
   const now = Date.now();
   cleanupRuntimeState(now);
-  const key = miniAppClientKey(req);
+  const key = miniAppClientKey(req, authorization);
+  const bucket = miniAppApiRateBuckets.get(key) || [];
+  const fresh = bucket.filter((time) => now - time < MINI_APP_API_WINDOW_MS);
+  fresh.push(now);
+  miniAppApiRateBuckets.set(key, fresh);
+  return fresh.length > MINI_APP_API_MAX_REQUESTS;
+}
+
+function isMiniAppAiRateLimited(req, authorization) {
+  const now = Date.now();
+  cleanupRuntimeState(now);
+  const key = miniAppClientKey(req, authorization);
   const bucket = miniAppAiRateBuckets.get(key) || [];
   const fresh = bucket.filter((time) => now - time < MINI_APP_AI_WINDOW_MS);
   fresh.push(now);
@@ -123,6 +179,15 @@ function cleanupRuntimeState(now = Date.now()) {
       rateBuckets.set(key, fresh);
     } else {
       rateBuckets.delete(key);
+    }
+  }
+
+  for (const [key, bucket] of miniAppApiRateBuckets.entries()) {
+    const fresh = bucket.filter((time) => now - time < MINI_APP_API_WINDOW_MS);
+    if (fresh.length) {
+      miniAppApiRateBuckets.set(key, fresh);
+    } else {
+      miniAppApiRateBuckets.delete(key);
     }
   }
 
@@ -1763,26 +1828,31 @@ function miniAppStopQuery(value) {
 
 function localTransportIntent(query) {
   const text = normalizeTransportSearchText(query);
+  const trolleyPattern = /троллейбус|тролейбус|тролл|тралик|тралей|тролик|трал(?:\s|$)/;
+  const busPattern = /автобус|автоб|автик|авт(?:\s|$)/;
+  const transportWords = "автобус|автоб|автик|авт|троллейбус|тролейбус|тролл|тралик|тралей|тролик|трал";
   const ordinalNumbers = {
     первый: "1", второй: "2", третий: "3", четвертый: "4", пятый: "5",
     шестой: "6", седьмой: "7", восьмой: "8", девятый: "9", десятый: "10"
   };
-  const type = /троллейбус|тролл/.test(text) ? "Тб" : /автобус|авт /.test(`${text} `) ? "А" : null;
-  const routeMatch = text.match(/(?:автобус|авт|троллейбус|тролл|маршрут)\s*(?:номер|номера|n|no)?\s*(\d{1,3}[a-zа-я]?)/i)
+  const type = trolleyPattern.test(text) ? "Тб" : busPattern.test(`${text} `) ? "А" : null;
+  const routeMatch = text.match(new RegExp(`(?:${transportWords}|маршрут)\\s*(?:номер|номера|n|no)?\\s*(\\d{1,3}[a-zа-я]?)`, "i"))
     || text.match(/(?:^|\s)(?:номер|n|no)\s*(\d{1,3}[a-zа-я]?)/i)
-    || text.match(/(?:^|\s)(\d{1,3}[a-zа-я]?)\s*(?:автобус|авт|троллейбус|тролл)/i);
+    || text.match(new RegExp(`(?:^|\\s)(\\d{1,3}[a-zа-я]?)\\s*(?:${transportWords})`, "i"));
   let route = routeMatch ? miniAppRouteNumber(routeMatch[1]) : null;
 
   if (!route) {
     for (const [word, number] of Object.entries(ordinalNumbers)) {
-      if (new RegExp(`(?:^|\\s)${word}\\s+(?:автобус|авт|троллейбус|тролл)`, "i").test(text)) {
+      if (new RegExp(`(?:^|\\s)${word}\\s+(?:${transportWords})`, "i").test(text)) {
         route = number;
         break;
       }
     }
   }
 
-  const stopMatch = String(query).match(/(?:остановк(?:а|е|и|у|ой)?|на\s+остановк(?:е|у|и|ой)?)\s*[:,-]?\s*(.+)$/i);
+  const source = String(query);
+  const stopMatch = source.match(/(?:остановк(?:а|е|и|у|ой)?|на\s+остановк(?:е|у|и|ой)?)\s*[:,-]?\s*(.+)$/i)
+    || source.match(/,\s*([^,]+?)\s*$/);
   return {
     type,
     route,
@@ -1852,7 +1922,7 @@ async function geminiTransportIntent(query) {
     },
     body: JSON.stringify({
       model: GEMINI_MODEL,
-      system_instruction: "Ты разбираешь запрос к городскому транспорту Гродно. Верни только JSON без Markdown: {\"transportType\":\"A\"|\"Tb\"|null,\"routeNumber\":string|null,\"stopQuery\":string|null}. A — автобус, Tb — троллейбус. Из русских порядковых числительных извлекай номер маршрута. Не придумывай номер или остановку, если их нет в сообщении.",
+      system_instruction: "Ты разбираешь запрос к городскому транспорту Гродно. Верни только JSON без Markdown: {\"transportType\":\"A\"|\"Tb\"|null,\"routeNumber\":string|null,\"stopQuery\":string|null}. A — автобус, Tb — троллейбус. Слова «автик», «авт» означают автобус; «тралик», «тролик», «тралей», «трал» — троллейбус. Из русских порядковых числительных извлекай номер маршрута; остановка может быть указана после запятой. Не придумывай номер или остановку, если их нет в сообщении.",
       input: query,
       generation_config: { temperature: 0 }
     })
@@ -1917,6 +1987,25 @@ function nextThreeHourDepartures(schedule, now = new Date()) {
   return departures.sort((a, b) => a.minutesUntil - b.minutes).slice(0, 24);
 }
 
+function editDistanceWithin(left, right, limit) {
+  if (Math.abs(left.length - right.length) > limit) return limit + 1;
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let row = 1; row <= left.length; row += 1) {
+    const current = [row];
+    let smallest = current[0];
+    for (let column = 1; column <= right.length; column += 1) {
+      const value = left[row - 1] === right[column - 1]
+        ? previous[column - 1]
+        : Math.min(previous[column - 1], previous[column], current[column - 1]) + 1;
+      current.push(value);
+      if (value < smallest) smallest = value;
+    }
+    if (smallest > limit) return limit + 1;
+    previous = current;
+  }
+  return previous[right.length];
+}
+
 function stopMatchScore(stopName, query) {
   const stop = normalizeTransportSearchText(stopName);
   const search = normalizeTransportSearchText(query);
@@ -1925,8 +2014,13 @@ function stopMatchScore(stopName, query) {
   if (stop.startsWith(search)) return 90;
   if (stop.includes(search) || search.includes(stop)) return 80;
   const words = search.split(" ").filter((word) => word.length > 1);
-  const common = words.filter((word) => stop.includes(word)).length;
-  return common ? Math.round((common / words.length) * 60) : 0;
+  const stopWords = stop.split(" ").filter((word) => word.length > 1);
+  const matches = words.filter((word) => stopWords.some((stopWord) => {
+    if (stopWord.includes(word) || word.includes(stopWord)) return true;
+    const limit = word.length >= 7 && stopWord.length >= 7 ? 1 : 0;
+    return limit > 0 && editDistanceWithin(word, stopWord, limit) <= limit;
+  })).length;
+  return matches ? Math.round((matches / words.length) * 65) : 0;
 }
 
 async function getMiniAppAiTransportAnswer(query) {
@@ -3051,6 +3145,7 @@ function miniAppHtml() {
       function request(path, options) {
         options = options || {};
         options.headers = Object.assign({ Accept: "application/json" }, options.headers || {});
+        if (telegram && telegram.initData) options.headers["X-Telegram-Init-Data"] = telegram.initData;
         return fetch(path, options).then(function (response) {
           if (!response.ok) throw new Error("request failed");
           return response.json();
@@ -3433,12 +3528,23 @@ async function getMiniAppWeather(cityQuery) {
 }
 
 async function handleMiniAppRequest(req, res, requestUrl) {
+  const isMiniAppApi = requestUrl.pathname.startsWith("/api/");
+  const authorization = isMiniAppApi ? miniAppAuthorization(req) : null;
+  if (isMiniAppApi && !authorization) {
+    miniAppError(res, 401, "Open the Mini App from Telegram to use its API");
+    return true;
+  }
+  if (isMiniAppApi && isMiniAppApiRateLimited(req, authorization)) {
+    miniAppError(res, 429, "Too many requests. Please wait a minute.");
+    return true;
+  }
+
   if (requestUrl.pathname === "/api/transport/assistant") {
     if (req.method !== "POST") {
       miniAppError(res, 405, "Method not allowed");
       return true;
     }
-    if (isMiniAppAiRateLimited(req)) {
+    if (isMiniAppAiRateLimited(req, authorization)) {
       miniAppError(res, 429, "Too many requests. Please wait a minute.");
       return true;
     }
