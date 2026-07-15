@@ -26,7 +26,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const WEBHOOK_PATH = `/telegram${WEBHOOK_SECRET ? `/${WEBHOOK_SECRET}` : ""}`;
 const MINI_APP_PATH = "/transport";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GEMINI_TOKEN || process.env.GEMINI_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const GRODNO_TIME_ZONE = "Europe/Minsk";
 const MAX_MESSAGE_TEXT_LENGTH = 160;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -1911,7 +1911,15 @@ function cleanTransportIntent(value, fallback) {
 
 async function geminiTransportIntent(query) {
   if (!GEMINI_API_KEY) return null;
-  const response = await fetchJson("https://generativelanguage.googleapis.com/v1beta/interactions", {
+  const prompt = [
+    "Ты разбираешь запрос к городскому транспорту Гродно.",
+    "Верни только JSON без Markdown: {\"transportType\":\"A\"|\"Tb\"|null,\"routeNumber\":string|null,\"stopQuery\":string|null}.",
+    "A — автобус, Tb — троллейбус. Слова «автик», «авт» означают автобус; «тралик», «тролик», «тралей», «трал» — троллейбус.",
+    "Из русских порядковых числительных извлекай номер маршрута; остановка может быть указана после запятой.",
+    "Не придумывай номер или остановку, если их нет в сообщении.",
+    `Запрос пользователя: ${query}`
+  ].join("\n");
+  const response = await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`, {
     method: "POST",
     timeoutMs: 12000,
     maxBytes: 256 * 1024,
@@ -1921,10 +1929,13 @@ async function geminiTransportIntent(query) {
       "x-goog-api-key": GEMINI_API_KEY
     },
     body: JSON.stringify({
-      model: GEMINI_MODEL,
-      system_instruction: "Ты разбираешь запрос к городскому транспорту Гродно. Верни только JSON без Markdown: {\"transportType\":\"A\"|\"Tb\"|null,\"routeNumber\":string|null,\"stopQuery\":string|null}. A — автобус, Tb — троллейбус. Слова «автик», «авт» означают автобус; «тралик», «тролик», «тралей», «трал» — троллейбус. Из русских порядковых числительных извлекай номер маршрута; остановка может быть указана после запятой. Не придумывай номер или остановку, если их нет в сообщении.",
-      input: query,
-      generation_config: { temperature: 0 }
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 128,
+        responseMimeType: "application/json",
+        thinkingConfig: { thinkingBudget: 0 }
+      }
     })
   });
   return parseGeminiJson(geminiOutputText(response));
