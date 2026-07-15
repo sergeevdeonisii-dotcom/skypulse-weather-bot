@@ -4,6 +4,7 @@ const https = require("https");
 const path = require("path");
 const zlib = require("zlib");
 const crypto = require("crypto");
+const { configuredWeekendServiceDates, serviceDayForDateParts } = require("./transport-calendar");
 
 const envPath = path.join(__dirname, ".env");
 if (fs.existsSync(envPath)) {
@@ -29,6 +30,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const MINI_APP_ALLOW_LOCAL_UNVERIFIED = process.env.MINI_APP_ALLOW_LOCAL_UNVERIFIED === "true";
 const GRODNO_TIME_ZONE = "Europe/Minsk";
+const BELARUS_WEEKEND_SERVICE_DATES = configuredWeekendServiceDates(process.env.BELARUS_WEEKEND_SERVICE_DATES);
 const MAX_MESSAGE_TEXT_LENGTH = 160;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_MESSAGES = 18;
@@ -1948,6 +1950,9 @@ function grodnoClock(now = new Date()) {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: GRODNO_TIME_ZONE,
     weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     hourCycle: "h23"
@@ -1957,8 +1962,15 @@ function grodnoClock(now = new Date()) {
     .map((part) => [part.type, part.value]));
   const hour = Number(values.hour);
   const minute = Number(values.minute);
+  const year = Number(values.year);
+  const month = Number(values.month);
+  const day = Number(values.day);
   return {
     weekday: values.weekday || "Mon",
+    year,
+    month,
+    day,
+    date: `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
     minutes: hour * 60 + minute,
     time: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
   };
@@ -1980,21 +1992,26 @@ function scheduleMinutes(lines) {
   return times;
 }
 
-function nextThreeHourDepartures(schedule, now = new Date()) {
+function nextTwoHourDepartures(schedule, now = new Date()) {
   const current = grodnoClock(now);
   const departures = [];
   for (let dayOffset = 0; dayOffset <= 1; dayOffset += 1) {
     const clock = grodnoClock(new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000));
-    const isWeekend = clock.weekday === "Sat" || clock.weekday === "Sun";
-    const lines = isWeekend ? schedule.schedule.weekend : schedule.schedule.weekdays;
+    const serviceDay = serviceDayForDateParts(clock, BELARUS_WEEKEND_SERVICE_DATES);
+    const lines = serviceDay.mode === "weekend" ? schedule.schedule.weekend : schedule.schedule.weekdays;
     for (const item of scheduleMinutes(lines)) {
       const minutesUntil = dayOffset * 24 * 60 + item.minuteOfDay - current.minutes;
-      if (minutesUntil < 0 || minutesUntil > 180) continue;
+      if (minutesUntil < 0 || minutesUntil > 120) continue;
       departures.push({
         time: `${String(Math.floor(item.minuteOfDay / 60)).padStart(2, "0")}:${String(item.minuteOfDay % 60).padStart(2, "0")}`,
         minutesUntil,
         tomorrow: dayOffset === 1,
-        inGarage: item.inGarage
+        inGarage: item.inGarage,
+        serviceDay: {
+          mode: serviceDay.mode,
+          label: serviceDay.label,
+          date: serviceDay.date
+        }
       });
     }
   }
@@ -2094,10 +2111,11 @@ async function getMiniAppAiTransportAnswer(query) {
   }
 
   const checkedAt = grodnoClock();
+  const currentServiceDay = serviceDayForDateParts(checkedAt, BELARUS_WEEKEND_SERVICE_DATES);
   const directions = [];
   for (const match of matches) {
     const schedule = await getBtransStopSchedule(match.stop.url);
-    const departures = nextThreeHourDepartures(schedule);
+    const departures = nextTwoHourDepartures(schedule);
     directions.push({
       stopName: schedule.stopName || match.stop.name,
       direction: schedule.direction || match.direction.title,
@@ -2109,13 +2127,14 @@ async function getMiniAppAiTransportAnswer(query) {
     kind: "result",
     aiUsed,
     checkedAt: checkedAt.time,
+    calendar: currentServiceDay,
     route: {
       type: intent.type,
       num: route.num,
       title: route.title || `${transportTypeName(intent.type, "ru")} ${route.num}`
     },
     directions,
-    message: "Ближайшие рейсы по опубликованному расписанию на следующие 3 часа."
+    message: `Ближайшие рейсы по опубликованному расписанию на следующие 2 часа. Сегодня — ${currentServiceDay.label}: используется ${currentServiceDay.mode === "weekend" ? "расписание выходного дня" : "буднее расписание"}.`
   };
 }
 
@@ -3066,7 +3085,7 @@ function miniAppHtml() {
 
     <section class="card assistant-card">
       <strong>🤖 Умный поиск по остановке</strong>
-      <p class="muted">Напиши по‑простому: «второй автобус, остановка Автовокзал». Покажем рейсы на ближайшие 3 часа по текущему времени Гродно.</p>
+      <p class="muted">Напиши по‑простому: «второй автобус, остановка Автовокзал». Покажем рейсы на ближайшие 2 часа по времени Гродно — с учётом выходных и официальных нерабочих дней Беларуси.</p>
       <form id="assistant-form" class="assistant-form">
         <input id="assistant-query" type="search" maxlength="280" autocomplete="off" placeholder="Автобус 2, остановка Автовокзал" aria-label="Запрос по транспорту">
         <button class="primary" type="submit">Найти</button>
@@ -3248,7 +3267,7 @@ function miniAppHtml() {
         assistantResult.appendChild(heading);
         var meta = document.createElement("p");
         meta.className = "muted";
-        meta.textContent = "Сейчас в Гродно " + String(answer.checkedAt) + ". " + (answer.message || "Ближайшие 3 часа.");
+        meta.textContent = "Сейчас в Гродно " + String(answer.checkedAt) + ". " + (answer.message || "Ближайшие 2 часа.");
         assistantResult.appendChild(meta);
         (answer.directions || []).forEach(function (direction) {
           var block = document.createElement("div");
@@ -3270,7 +3289,7 @@ function miniAppHtml() {
           } else {
             var empty = document.createElement("span");
             empty.className = "muted";
-            empty.textContent = "В следующие 3 часа рейсов по опубликованному расписанию нет.";
+            empty.textContent = "В следующие 2 часа рейсов по опубликованному расписанию нет.";
             list.appendChild(empty);
           }
           block.appendChild(stop);
@@ -3775,16 +3794,6 @@ function startWebhookServer() {
   });
 }
 
-if (!BOT_TOKEN) {
-  console.error("BOT_TOKEN is missing. Create .env from .env.example and paste BotFather token.");
-  process.exit(1);
-}
-
-if (PORT && !WEBHOOK_SECRET) {
-  console.error("WEBHOOK_SECRET is missing. Refusing to start webhook mode without Telegram secret protection.");
-  process.exit(1);
-}
-
 async function startPollingSafely() {
   try {
     const webhook = await telegram("getWebhookInfo", {});
@@ -3800,8 +3809,25 @@ async function startPollingSafely() {
   poll();
 }
 
-if (PORT) {
-  startWebhookServer();
-} else {
-  startPollingSafely();
+if (require.main === module) {
+  if (!BOT_TOKEN) {
+    console.error("BOT_TOKEN is missing. Create .env from .env.example and paste BotFather token.");
+    process.exit(1);
+  }
+
+  if (PORT && !WEBHOOK_SECRET) {
+    console.error("WEBHOOK_SECRET is missing. Refusing to start webhook mode without Telegram secret protection.");
+    process.exit(1);
+  }
+
+  if (PORT) {
+    startWebhookServer();
+  } else {
+    startPollingSafely();
+  }
 }
+
+module.exports = {
+  grodnoClock,
+  nextTwoHourDepartures
+};
