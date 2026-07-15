@@ -25,6 +25,9 @@ const PORT = Number(process.env.PORT || 0);
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const WEBHOOK_PATH = `/telegram${WEBHOOK_SECRET ? `/${WEBHOOK_SECRET}` : ""}`;
 const MINI_APP_PATH = "/transport";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GEMINI_TOKEN || process.env.GEMINI_KEY || "";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+const GRODNO_TIME_ZONE = "Europe/Minsk";
 const MAX_MESSAGE_TEXT_LENGTH = 160;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_MESSAGES = 18;
@@ -36,12 +39,15 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 const ADVICE_TTL_MS = 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_FAVORITE_ROUTES = 12;
+const MINI_APP_AI_WINDOW_MS = 60 * 1000;
+const MINI_APP_AI_MAX_REQUESTS = 8;
 const PREFERENCES_FILE = process.env.PREFERENCES_FILE || path.join(__dirname, "data", "user-preferences.json");
 
 const userSessions = new Map();
 const userLanguages = new Map();
 const lastClothingAdvice = new Map();
 const rateBuckets = new Map();
+const miniAppAiRateBuckets = new Map();
 const userPreferences = new Map();
 const transportCache = {
   routes: { value: null, expiresAt: 0 },
@@ -84,6 +90,22 @@ function isRateLimited(chatId, kind = "message") {
   return fresh.length > limit;
 }
 
+function miniAppClientKey(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwarded || req.socket?.remoteAddress || "unknown";
+}
+
+function isMiniAppAiRateLimited(req) {
+  const now = Date.now();
+  cleanupRuntimeState(now);
+  const key = miniAppClientKey(req);
+  const bucket = miniAppAiRateBuckets.get(key) || [];
+  const fresh = bucket.filter((time) => now - time < MINI_APP_AI_WINDOW_MS);
+  fresh.push(now);
+  miniAppAiRateBuckets.set(key, fresh);
+  return fresh.length > MINI_APP_AI_MAX_REQUESTS;
+}
+
 function cleanupCallbackStore() {
   const now = Date.now();
   for (const [token, payload] of callbackStore.entries()) {
@@ -101,6 +123,15 @@ function cleanupRuntimeState(now = Date.now()) {
       rateBuckets.set(key, fresh);
     } else {
       rateBuckets.delete(key);
+    }
+  }
+
+  for (const [key, bucket] of miniAppAiRateBuckets.entries()) {
+    const fresh = bucket.filter((time) => now - time < MINI_APP_AI_WINDOW_MS);
+    if (fresh.length) {
+      miniAppAiRateBuckets.set(key, fresh);
+    } else {
+      miniAppAiRateBuckets.delete(key);
     }
   }
 
@@ -652,9 +683,11 @@ async function fetchJson(url, {
   timeoutMs = 9000,
   maxBytes = MAX_EXTERNAL_RESPONSE_BYTES,
   headers = {},
+  method = "GET",
+  body,
   label = "External API"
 } = {}) {
-  const response = await fetchWithTimeout(url, { headers }, timeoutMs);
+  const response = await fetchWithTimeout(url, { method, headers, body }, timeoutMs);
   if (!response.ok) throw new Error(`${label} request failed (HTTP ${response.status})`);
 
   const text = await readLimitedFetchText(response, maxBytes);
@@ -1708,6 +1741,276 @@ async function getBtransStopSchedule(url) {
   return value;
 }
 
+function miniAppTransportQuery(value) {
+  const query = String(value || "").trim().replace(/\s+/g, " ");
+  return query.length >= 2 && query.length <= 280 && !/[\r\n\u0000]/.test(query) ? query : null;
+}
+
+function normalizeTransportSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[^a-zа-я0-9]+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function miniAppStopQuery(value) {
+  const stop = String(value || "").trim().replace(/\s+/g, " ");
+  if (stop.length < 2 || stop.length > 100 || /[\r\n\u0000]/.test(stop)) return null;
+  return stop;
+}
+
+function localTransportIntent(query) {
+  const text = normalizeTransportSearchText(query);
+  const ordinalNumbers = {
+    первый: "1", второй: "2", третий: "3", четвертый: "4", пятый: "5",
+    шестой: "6", седьмой: "7", восьмой: "8", девятый: "9", десятый: "10"
+  };
+  const type = /троллейбус|тролл/.test(text) ? "Тб" : /автобус|авт /.test(`${text} `) ? "А" : null;
+  const routeMatch = text.match(/(?:автобус|авт|троллейбус|тролл|маршрут)\s*(?:номер|номера|n|no)?\s*(\d{1,3}[a-zа-я]?)/i)
+    || text.match(/(?:^|\s)(?:номер|n|no)\s*(\d{1,3}[a-zа-я]?)/i)
+    || text.match(/(?:^|\s)(\d{1,3}[a-zа-я]?)\s*(?:автобус|авт|троллейбус|тролл)/i);
+  let route = routeMatch ? miniAppRouteNumber(routeMatch[1]) : null;
+
+  if (!route) {
+    for (const [word, number] of Object.entries(ordinalNumbers)) {
+      if (new RegExp(`(?:^|\\s)${word}\\s+(?:автобус|авт|троллейбус|тролл)`, "i").test(text)) {
+        route = number;
+        break;
+      }
+    }
+  }
+
+  const stopMatch = String(query).match(/(?:остановк(?:а|е|и|у|ой)?|на\s+остановк(?:е|у|и|ой)?)\s*[:,-]?\s*(.+)$/i);
+  return {
+    type,
+    route,
+    stopQuery: miniAppStopQuery(stopMatch?.[1])
+  };
+}
+
+function parseGeminiJson(text) {
+  const source = String(text || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = source.indexOf("{");
+  const end = source.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    const value = JSON.parse(source.slice(start, end + 1));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function geminiOutputText(response) {
+  if (typeof response?.output_text === "string") return response.output_text;
+  const legacy = response?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(legacy)) return legacy.map((part) => part?.text || "").join("\n");
+
+  const texts = [];
+  const visit = (value, depth = 0) => {
+    if (depth > 8 || value == null) return;
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, depth + 1));
+      return;
+    }
+    if (typeof value !== "object") return;
+    if (typeof value.text === "string") texts.push(value.text);
+    for (const [key, item] of Object.entries(value)) {
+      if (key === "input" || key === "system_instruction" || key === "text") continue;
+      visit(item, depth + 1);
+    }
+  };
+
+  visit(response?.output || response?.outputs || response?.steps || null);
+  return texts.join("\n");
+}
+
+function cleanTransportIntent(value, fallback) {
+  const rawType = String(value?.transportType ?? value?.type ?? "").trim();
+  const type = rawType === "A" || rawType === "А" || /^автобус/i.test(rawType)
+    ? "А"
+    : rawType === "Tb" || rawType === "Тб" || /^троллейбус/i.test(rawType)
+      ? "Тб"
+      : fallback.type;
+  const route = miniAppRouteNumber(value?.routeNumber ?? value?.route ?? value?.number) || fallback.route;
+  const stopQuery = miniAppStopQuery(value?.stopQuery ?? value?.stop ?? value?.station) || fallback.stopQuery;
+  return { type, route, stopQuery };
+}
+
+async function geminiTransportIntent(query) {
+  if (!GEMINI_API_KEY) return null;
+  const response = await fetchJson("https://generativelanguage.googleapis.com/v1beta/interactions", {
+    method: "POST",
+    timeoutMs: 12000,
+    maxBytes: 256 * 1024,
+    label: "Gemini",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": GEMINI_API_KEY
+    },
+    body: JSON.stringify({
+      model: GEMINI_MODEL,
+      system_instruction: "Ты разбираешь запрос к городскому транспорту Гродно. Верни только JSON без Markdown: {\"transportType\":\"A\"|\"Tb\"|null,\"routeNumber\":string|null,\"stopQuery\":string|null}. A — автобус, Tb — троллейбус. Из русских порядковых числительных извлекай номер маршрута. Не придумывай номер или остановку, если их нет в сообщении.",
+      input: query,
+      generation_config: { temperature: 0 }
+    })
+  });
+  return parseGeminiJson(geminiOutputText(response));
+}
+
+function grodnoClock(now = new Date()) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: GRODNO_TIME_ZONE,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  });
+  const values = Object.fromEntries(formatter.formatToParts(now)
+    .filter((part) => part.type !== "literal")
+    .map((part) => [part.type, part.value]));
+  const hour = Number(values.hour);
+  const minute = Number(values.minute);
+  return {
+    weekday: values.weekday || "Mon",
+    minutes: hour * 60 + minute,
+    time: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
+  };
+}
+
+function scheduleMinutes(lines) {
+  const times = [];
+  for (const line of lines || []) {
+    const match = String(line).match(/^\s*(\d{1,2})\s*:\s*(.*)$/);
+    if (!match) continue;
+    const hour = Number(match[1]);
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+    for (const minute of match[2].matchAll(/(?:^|\s)(\d{1,2})(\*)?(?=\s|$)/g)) {
+      const value = Number(minute[1]);
+      if (!Number.isInteger(value) || value < 0 || value > 59) continue;
+      times.push({ minuteOfDay: hour * 60 + value, inGarage: Boolean(minute[2]) });
+    }
+  }
+  return times;
+}
+
+function nextThreeHourDepartures(schedule, now = new Date()) {
+  const current = grodnoClock(now);
+  const departures = [];
+  for (let dayOffset = 0; dayOffset <= 1; dayOffset += 1) {
+    const clock = grodnoClock(new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000));
+    const isWeekend = clock.weekday === "Sat" || clock.weekday === "Sun";
+    const lines = isWeekend ? schedule.schedule.weekend : schedule.schedule.weekdays;
+    for (const item of scheduleMinutes(lines)) {
+      const minutesUntil = dayOffset * 24 * 60 + item.minuteOfDay - current.minutes;
+      if (minutesUntil < 0 || minutesUntil > 180) continue;
+      departures.push({
+        time: `${String(Math.floor(item.minuteOfDay / 60)).padStart(2, "0")}:${String(item.minuteOfDay % 60).padStart(2, "0")}`,
+        minutesUntil,
+        tomorrow: dayOffset === 1,
+        inGarage: item.inGarage
+      });
+    }
+  }
+  return departures.sort((a, b) => a.minutesUntil - b.minutes).slice(0, 24);
+}
+
+function stopMatchScore(stopName, query) {
+  const stop = normalizeTransportSearchText(stopName);
+  const search = normalizeTransportSearchText(query);
+  if (!stop || !search) return 0;
+  if (stop === search) return 100;
+  if (stop.startsWith(search)) return 90;
+  if (stop.includes(search) || search.includes(stop)) return 80;
+  const words = search.split(" ").filter((word) => word.length > 1);
+  const common = words.filter((word) => stop.includes(word)).length;
+  return common ? Math.round((common / words.length) * 60) : 0;
+}
+
+async function getMiniAppAiTransportAnswer(query) {
+  const fallback = localTransportIntent(query);
+  let intent = fallback;
+  let aiUsed = false;
+  try {
+    const gemini = await geminiTransportIntent(query);
+    if (gemini) {
+      intent = cleanTransportIntent(gemini, fallback);
+      aiUsed = true;
+    }
+  } catch (error) {
+    console.warn("Gemini transport parsing failed:", error.message);
+  }
+
+  if (!intent.type || !intent.route) {
+    return {
+      kind: "clarification",
+      aiUsed,
+      message: "Напиши вид транспорта и номер: например, «автобус 2, остановка Автовокзал»."
+    };
+  }
+  if (!intent.stopQuery) {
+    return {
+      kind: "clarification",
+      aiUsed,
+      message: `Маршрут ${intent.route} понял. Теперь напиши остановку, например: «автобус ${intent.route}, остановка Автовокзал».`
+    };
+  }
+
+  const route = await getBtransRoute(intent.type, intent.route);
+  if (!route || !route.directions.length) {
+    return {
+      kind: "not_found",
+      aiUsed,
+      message: `Маршрут ${intent.route} не найден. Проверь номер и тип транспорта.`
+    };
+  }
+
+  const matches = route.directions.flatMap((direction, directionIndex) => direction.stops.map((stop, stopIndex) => ({
+    direction,
+    directionIndex,
+    stop,
+    stopIndex,
+    score: stopMatchScore(stop.name, intent.stopQuery)
+  }))).filter((item) => item.score >= 45)
+    .sort((a, b) => b.score - a.score || a.directionIndex - b.directionIndex || a.stopIndex - b.stopIndex)
+    .slice(0, 4);
+
+  if (!matches.length) {
+    return {
+      kind: "not_found",
+      aiUsed,
+      message: `На маршруте ${intent.route} не нашёл остановку «${intent.stopQuery}». Попробуй написать её точнее.`
+    };
+  }
+
+  const checkedAt = grodnoClock();
+  const directions = [];
+  for (const match of matches) {
+    const schedule = await getBtransStopSchedule(match.stop.url);
+    const departures = nextThreeHourDepartures(schedule);
+    directions.push({
+      stopName: schedule.stopName || match.stop.name,
+      direction: schedule.direction || match.direction.title,
+      departures
+    });
+  }
+
+  return {
+    kind: "result",
+    aiUsed,
+    checkedAt: checkedAt.time,
+    route: {
+      type: intent.type,
+      num: route.num,
+      title: route.title || `${transportTypeName(intent.type, "ru")} ${route.num}`
+    },
+    directions,
+    message: "Ближайшие рейсы по опубликованному расписанию на следующие 3 часа."
+  };
+}
+
 function formatBtransSchedule(schedule, lang) {
   const weekdays = schedule.schedule.weekdays.length ? schedule.schedule.weekdays : [lang === "en" ? "No trips" : "нет рейсов"];
   const weekend = schedule.schedule.weekend.length ? schedule.schedule.weekend : [lang === "en" ? "No trips" : "нет рейсов"];
@@ -2481,6 +2784,7 @@ async function configureMiniAppMenuButton() {
     console.warn("Mini App menu button was skipped because its URL is missing.");
     return;
   }
+
   await telegram("setChatMenuButton", {
     menu_button: {
       type: "web_app",
@@ -2598,7 +2902,19 @@ function miniAppHtml() {
     .forecast-days { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
     .forecast-day { padding: 12px; border: 1px solid var(--border); border-radius: 13px; }
     .forecast-day strong { display: block; }
+    .clothing-toggle { width: 100%; margin-top: 12px; }
+    .clothing-card { padding: 12px; margin-top: 10px; border: 1px solid var(--border); border-radius: 13px; }
+    .clothing-card p { margin-top: 8px; }
+    .assistant-card { margin-top: 16px; }
+    .assistant-form { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin-top: 12px; }
+    .assistant-result { margin-top: 10px; }
+    .assistant-direction { padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--border); }
+    .assistant-direction:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+    .departure-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+    .departure { padding: 6px 8px; border: 1px solid var(--border); border-radius: 9px; font-variant-numeric: tabular-nums; font-size: 14px; }
+    .departure strong { display: block; }
     [hidden] { display: none !important; }
+    @media (max-width: 430px) { .assistant-form { grid-template-columns: 1fr; } }
     @media (max-width: 360px) { .route-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } .schedule-grid, .forecast-days { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -2624,6 +2940,13 @@ function miniAppHtml() {
         <p id="weather-now" class="weather-now"></p>
         <p id="weather-details" class="muted"></p>
         <div id="forecast-days" class="forecast-days"></div>
+        <button id="clothing-toggle" class="clothing-toggle" type="button" aria-expanded="false">🧥 А что по одежде?</button>
+        <div id="clothing-card" class="clothing-card" hidden>
+          <strong id="clothing-title"></strong>
+          <p id="clothing-base"></p>
+          <p id="clothing-shoes"></p>
+          <p id="clothing-extra" class="muted"></p>
+        </div>
       </div>
     </section>
 
@@ -2632,6 +2955,17 @@ function miniAppHtml() {
       <h1>🚌 Расписание Гродно</h1>
       <p class="muted">Выбери маршрут и остановку — покажем время в будни и выходные.</p>
     </header>
+
+    <section class="card assistant-card">
+      <strong>🤖 Умный поиск по остановке</strong>
+      <p class="muted">Напиши по‑простому: «второй автобус, остановка Автовокзал». Покажем рейсы на ближайшие 3 часа по текущему времени Гродно.</p>
+      <form id="assistant-form" class="assistant-form">
+        <input id="assistant-query" type="search" maxlength="280" autocomplete="off" placeholder="Автобус 2, остановка Автовокзал" aria-label="Запрос по транспорту">
+        <button class="primary" type="submit">Найти</button>
+      </form>
+      <div id="assistant-notice" class="notice" role="status"></div>
+      <div id="assistant-result" class="assistant-result" hidden></div>
+    </section>
 
     <section class="tabs" aria-label="Тип транспорта">
       <button class="selected" type="button" data-type="A">🚌 Автобусы</button>
@@ -2697,6 +3031,16 @@ function miniAppHtml() {
       var weatherNow = document.getElementById("weather-now");
       var weatherDetails = document.getElementById("weather-details");
       var forecastDays = document.getElementById("forecast-days");
+      var clothingToggle = document.getElementById("clothing-toggle");
+      var clothingCard = document.getElementById("clothing-card");
+      var clothingTitle = document.getElementById("clothing-title");
+      var clothingBase = document.getElementById("clothing-base");
+      var clothingShoes = document.getElementById("clothing-shoes");
+      var clothingExtra = document.getElementById("clothing-extra");
+      var assistantForm = document.getElementById("assistant-form");
+      var assistantQuery = document.getElementById("assistant-query");
+      var assistantNotice = document.getElementById("assistant-notice");
+      var assistantResult = document.getElementById("assistant-result");
       var transportLoaded = false;
 
       function setNotice(text, isError) {
@@ -2704,8 +3048,10 @@ function miniAppHtml() {
         notice.className = isError ? "notice error" : "notice";
       }
 
-      function request(path) {
-        return fetch(path, { headers: { Accept: "application/json" } }).then(function (response) {
+      function request(path, options) {
+        options = options || {};
+        options.headers = Object.assign({ Accept: "application/json" }, options.headers || {});
+        return fetch(path, options).then(function (response) {
           if (!response.ok) throw new Error("request failed");
           return response.json();
         }).then(function (body) {
@@ -2714,9 +3060,22 @@ function miniAppHtml() {
         });
       }
 
+      function postJson(path, body) {
+        return request(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+      }
+
       function setWeatherNotice(text, isError) {
         weatherNotice.textContent = text || "";
         weatherNotice.className = isError ? "notice error" : "notice";
+      }
+
+      function setAssistantNotice(text, isError) {
+        assistantNotice.textContent = text || "";
+        assistantNotice.className = isError ? "notice error" : "notice";
       }
 
       function switchSection(section) {
@@ -2751,7 +3110,66 @@ function miniAppHtml() {
           card.appendChild(temperature);
           forecastDays.appendChild(card);
         });
+        var clothing = weather.clothing || {};
+        clothingTitle.textContent = clothing.title || "А что по одежде?";
+        clothingBase.textContent = "База: " + (clothing.base || "смотри по погоде.");
+        clothingShoes.textContent = clothing.shoes || "";
+        clothingExtra.textContent = clothing.extra || "";
+        clothingCard.hidden = true;
+        clothingToggle.setAttribute("aria-expanded", "false");
         weatherResult.hidden = false;
+      }
+
+      function departureText(departure) {
+        var when = departure.minutesUntil <= 0 ? "сейчас" : "через " + String(departure.minutesUntil) + " мин";
+        return departure.time + (departure.tomorrow ? " завтра" : "") + " · " + when + (departure.inGarage ? " *" : "");
+      }
+
+      function renderAssistant(answer) {
+        assistantResult.replaceChildren();
+        var heading = document.createElement("strong");
+        if (answer.kind !== "result") {
+          heading.textContent = answer.message || "Уточни маршрут и остановку.";
+          assistantResult.appendChild(heading);
+          assistantResult.hidden = false;
+          return;
+        }
+
+        heading.textContent = answer.route.title || ("Маршрут " + String(answer.route.num));
+        assistantResult.appendChild(heading);
+        var meta = document.createElement("p");
+        meta.className = "muted";
+        meta.textContent = "Сейчас в Гродно " + String(answer.checkedAt) + ". " + (answer.message || "Ближайшие 3 часа.");
+        assistantResult.appendChild(meta);
+        (answer.directions || []).forEach(function (direction) {
+          var block = document.createElement("div");
+          block.className = "assistant-direction";
+          var stop = document.createElement("strong");
+          stop.textContent = direction.stopName || "Остановка";
+          var destination = document.createElement("p");
+          destination.className = "muted";
+          destination.textContent = direction.direction || "";
+          var list = document.createElement("div");
+          list.className = "departure-list";
+          if (direction.departures && direction.departures.length) {
+            direction.departures.forEach(function (departure) {
+              var item = document.createElement("span");
+              item.className = "departure";
+              item.textContent = departureText(departure);
+              list.appendChild(item);
+            });
+          } else {
+            var empty = document.createElement("span");
+            empty.className = "muted";
+            empty.textContent = "В следующие 3 часа рейсов по опубликованному расписанию нет.";
+            list.appendChild(empty);
+          }
+          block.appendChild(stop);
+          if (direction.direction) block.appendChild(destination);
+          block.appendChild(list);
+          assistantResult.appendChild(block);
+        });
+        assistantResult.hidden = false;
       }
 
       function loadWeather(city) {
@@ -2894,6 +3312,27 @@ function miniAppHtml() {
         event.preventDefault();
         loadWeather(weatherCityInput.value);
       });
+      clothingToggle.addEventListener("click", function () {
+        clothingCard.hidden = !clothingCard.hidden;
+        clothingToggle.setAttribute("aria-expanded", clothingCard.hidden ? "false" : "true");
+      });
+      assistantForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var query = String(assistantQuery.value || "").trim();
+        if (query.length < 2) {
+          setAssistantNotice("Напиши номер маршрута и остановку.", true);
+          return;
+        }
+        assistantResult.hidden = true;
+        setAssistantNotice("Разбираю запрос и ищу рейсы…", false);
+        postJson("/api/transport/assistant", { query: query }).then(function (data) {
+          renderAssistant(data.answer || {});
+          setAssistantNotice("", false);
+        }).catch(function () {
+          assistantResult.hidden = true;
+          setAssistantNotice("Не получилось найти рейсы. Проверь номер и остановку, затем попробуй ещё раз.", true);
+        });
+      });
       var initialCity = "Гродно";
       try { initialCity = localStorage.getItem("skypulse-city") || initialCity; } catch (_) {}
       weatherCityInput.value = initialCity;
@@ -2923,6 +3362,35 @@ function miniAppCityQuery(value) {
 function miniAppRounded(value) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.round(number) : null;
+}
+
+function getMiniAppClothingAdvice(city, weather, current, currentCode) {
+  const apparent = miniAppRounded(current.apparent_temperature);
+  const temperature = miniAppRounded(current.temperature_2m);
+  const wind = miniAppRounded(current.wind_speed_10m);
+  const precipitation = miniAppRounded(weather.daily.precipitation_probability_max?.[0]) || 0;
+  const base = getBaseClothing(apparent ?? temperature ?? 0, "ru");
+  const shoes = getShoeAdvice(apparent ?? temperature ?? 0, precipitation, currentCode, "ru");
+  let extra;
+
+  if (wind != null && wind >= 25) {
+    extra = `Ветер ${wind} км/ч — добавь слой с защитой от ветра.`;
+  } else if (precipitation >= 60) {
+    extra = `Осадки вероятны (${precipitation}%) — возьми зонт или капюшон.`;
+  } else if (precipitation >= 30) {
+    extra = `Осадки возможны (${precipitation}%) — компактный зонт будет кстати.`;
+  } else {
+    extra = "Если будешь долго на улице, возьми тонкий дополнительный слой.";
+  }
+
+  return {
+    title: "А что по одежде?",
+    base,
+    shoes,
+    extra,
+    apparent,
+    temperature
+  };
 }
 
 async function getMiniAppWeather(cityQuery) {
@@ -2959,11 +3427,47 @@ async function getMiniAppWeather(cityQuery) {
       apparent: miniAppRounded(current.apparent_temperature),
       wind: miniAppRounded(current.wind_speed_10m)
     },
+    clothing: getMiniAppClothingAdvice(city, weather, current, currentCode),
     days
   };
 }
 
 async function handleMiniAppRequest(req, res, requestUrl) {
+  if (requestUrl.pathname === "/api/transport/assistant") {
+    if (req.method !== "POST") {
+      miniAppError(res, 405, "Method not allowed");
+      return true;
+    }
+    if (isMiniAppAiRateLimited(req)) {
+      miniAppError(res, 429, "Too many requests. Please wait a minute.");
+      return true;
+    }
+
+    let payload;
+    try {
+      const body = await readRequestBody(req, 16 * 1024);
+      payload = JSON.parse(body);
+    } catch (error) {
+      miniAppError(res, error?.message === "Request body too large" ? 413 : 400, "Invalid request");
+      return true;
+    }
+
+    const query = miniAppTransportQuery(payload?.query);
+    if (!query) {
+      miniAppError(res, 400, "Invalid transport query");
+      return true;
+    }
+
+    try {
+      const answer = await getMiniAppAiTransportAnswer(query);
+      sendJson(res, 200, { ok: true, answer });
+    } catch (error) {
+      console.error("Mini App AI transport error:", error.message);
+      miniAppError(res, 502, "Transport service is unavailable");
+    }
+    return true;
+  }
+
   if (req.method !== "GET") return false;
 
   if (requestUrl.pathname === MINI_APP_PATH) {
