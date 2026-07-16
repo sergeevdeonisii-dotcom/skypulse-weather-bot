@@ -39,7 +39,7 @@ features. Keep real user IDs in platform configuration rather than the repositor
 
 If only a Telegram username is known, configure a pending gift with
 `COMPLIMENTARY_PRO_USERNAME_GIFTS`. Use comma-separated `username:months` pairs,
-for example `skyfriend:6`. Telegram does not disclose a private user's numeric ID to
+from 1 to 120 months, for example `skyfriend:6`. Telegram does not disclose a private user's numeric ID to
 a bot by username, so the gift is issued exactly once when that person next starts
 or messages the bot. The recipient then receives the usual Pro confirmation from
 the bot. Usernames are matched case-insensitively without `@`; keep this setting in

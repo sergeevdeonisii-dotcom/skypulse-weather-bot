@@ -40,6 +40,7 @@ const PRO_INVOICE_TTL_SECONDS = 20 * 60;
 const PRO_PAYMENTS_ENABLED = process.env.PRO_PAYMENTS_ENABLED !== "false";
 const PRO_PAYMENT_SIGNING_SECRET = String(process.env.PRO_PAYMENT_SIGNING_SECRET || BOT_TOKEN || "");
 const PAYMENT_SUPPORT_USERNAME = String(process.env.PAYMENT_SUPPORT_USERNAME || "pitrparkeryouoi").trim().replace(/^@+/, "");
+const MAX_COMPLIMENTARY_PRO_GIFT_MONTHS = 120;
 const COMPLIMENTARY_PRO_USER_IDS = [...new Set(
   String(process.env.COMPLIMENTARY_PRO_USER_IDS || "")
     .split(",")
@@ -206,7 +207,7 @@ function parseComplimentaryProUsernameGifts(value) {
     const [rawUsername, rawMonths, ...extraParts] = rawGift.trim().split(":");
     const username = telegramUsername(rawUsername);
     const months = Number(rawMonths);
-    if (extraParts.length || !username || !Number.isInteger(months) || months < 1 || months > 24) continue;
+    if (extraParts.length || !username || !Number.isInteger(months) || months < 1 || months > MAX_COMPLIMENTARY_PRO_GIFT_MONTHS) continue;
     gifts.set(username, months);
   }
   return gifts;
@@ -215,7 +216,7 @@ function parseComplimentaryProUsernameGifts(value) {
 function addCalendarMonthsToEpoch(startEpoch, months) {
   const start = Number(startEpoch);
   const durationMonths = Number(months);
-  if (!Number.isSafeInteger(start) || start <= 0 || !Number.isInteger(durationMonths) || durationMonths < 1 || durationMonths > 24) {
+  if (!Number.isSafeInteger(start) || start <= 0 || !Number.isInteger(durationMonths) || durationMonths < 1 || durationMonths > MAX_COMPLIMENTARY_PRO_GIFT_MONTHS) {
     return null;
   }
 

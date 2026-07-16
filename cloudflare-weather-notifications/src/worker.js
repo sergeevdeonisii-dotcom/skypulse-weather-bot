@@ -1,5 +1,6 @@
 const MAX_RECIPIENTS_PER_RUN = 30;
-const MAX_PRO_EXPIRY_SECONDS = 400 * 24 * 60 * 60;
+// Allows a 10-calendar-year complimentary gift plus an already-active period.
+const MAX_PRO_EXPIRY_SECONDS = 11 * 366 * 24 * 60 * 60;
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",

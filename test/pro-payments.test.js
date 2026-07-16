@@ -131,6 +131,10 @@ test("queues username gifts safely and calculates their calendar expiry", () => 
     addCalendarMonthsToEpoch(januaryThirtyFirst, 1),
     Math.floor(Date.UTC(2027, 1, 28, 12, 15, 0) / 1000)
   );
+  assert.equal(
+    addCalendarMonthsToEpoch(januaryThirtyFirst, 120),
+    Math.floor(Date.UTC(2037, 0, 31, 12, 15, 0) / 1000)
+  );
   assert.equal(complimentaryProChargeId("123456", "username-skyfriend"), "complimentary-pro-123456-username-skyfriend-v1");
   assert.equal(addCalendarMonthsToEpoch(januaryThirtyFirst, 0), null);
 });
