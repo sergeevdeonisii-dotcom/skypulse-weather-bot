@@ -171,6 +171,8 @@ async function updateProSubscription(request, env) {
   const chargeId = cleanPaymentChargeId(payload?.chargeId);
   const isFirstRecurring = payload?.isFirstRecurring === true;
   if (!expiresAt || !chargeId) return json({ ok: false, error: "Invalid Pro payment" }, 400);
+  const isComplimentary = isComplimentaryProChargeId(chargeId);
+  const shouldEnableAutoRenewal = isFirstRecurring && !isComplimentary;
 
   const paymentInsert = await env.DB.prepare(
     `INSERT OR IGNORE INTO pro_payments
@@ -193,17 +195,22 @@ async function updateProSubscription(request, env) {
            THEN excluded.expires_at ELSE pro_subscriptions.expires_at END,
          telegram_payment_charge_id = CASE WHEN ? = 1
            THEN excluded.telegram_payment_charge_id ELSE pro_subscriptions.telegram_payment_charge_id END,
-         auto_renewing = CASE WHEN ? = 1 THEN 1 ELSE pro_subscriptions.auto_renewing END,
+         auto_renewing = CASE
+           WHEN ? = 1 THEN excluded.auto_renewing
+           WHEN ? = 1 THEN 0
+           ELSE pro_subscriptions.auto_renewing
+         END,
          last_payment_at = excluded.last_payment_at,
          updated_at = CURRENT_TIMESTAMP`
     ).bind(
       chatId,
       expiresAt,
       chargeId,
-      replaceChargeId ? 1 : 0,
+      shouldEnableAutoRenewal ? 1 : 0,
       epochSeconds(),
       replaceChargeId ? 1 : 0,
-      replaceChargeId ? 1 : 0
+      shouldEnableAutoRenewal ? 1 : 0,
+      isComplimentary ? 1 : 0
     ).run();
   }
 
