@@ -7,6 +7,7 @@ const {
   parseProInvoicePayload,
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
+  proInfoText,
   proWelcomeText,
   parseComplimentaryProUsernameGifts,
   addCalendarMonthsToEpoch,
@@ -72,7 +73,15 @@ test("confirms a Pro purchase with the enabled notification features", () => {
   assert.match(text, /расширенные детали в уведомлениях о погоде каждые 3 часа/);
   assert.match(text, /совет по одежде/);
   assert.match(text, /план погоды на 24 часа/);
+  assert.match(text, /построение поездок по адресам с пересадками и картой/);
+  assert.match(text, /умный поиск ближайших рейсов по остановке/);
   assert.match(text, /дожде, сильном ветре и грозе/);
+});
+
+test("describes the Pro-only transport tools in the bot tariff conditions", () => {
+  const text = proInfoText("ru");
+  assert.match(text, /построение поездок по адресам с пересадками и картой/);
+  assert.match(text, /умный поиск по остановке/);
 });
 
 test("keeps outfit advice and the 24-hour plan out of the Free weather payload", () => {

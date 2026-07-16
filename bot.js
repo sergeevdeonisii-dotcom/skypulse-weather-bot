@@ -828,13 +828,13 @@ function proInfoText(lang) {
   if (lang === "en") {
     return [
       "<b>✨ SkyPulse Pro</b>",
-      `For ${PRO_MONTHLY_PRICE_STARS} Telegram Stars every 30 days: outfit guidance, a 24-hour weather plan with a recommended trip or walk window, and rain, wind, and thunderstorm warnings in weather notifications.`,
+      `For ${PRO_MONTHLY_PRICE_STARS} Telegram Stars every 30 days: outfit guidance, a 24-hour weather plan with a recommended trip or walk window, trip building by address with transfers and a map, smart stop search, and rain, wind, and thunderstorm warnings in weather notifications.`,
       "The subscription renews automatically and can be disabled at any time in the Mini App."
     ].join("\n");
   }
   return [
     "<b>✨ SkyPulse Pro</b>",
-    `${PRO_MONTHLY_PRICE_STARS} Telegram Stars за 30 дней: совет по одежде, план погоды на 24 часа с лучшим окном для дороги или прогулки и предупреждения о ливне, ветре и грозе в уведомлениях о погоде.`,
+    `${PRO_MONTHLY_PRICE_STARS} Telegram Stars за 30 дней: совет по одежде, план погоды на 24 часа с лучшим окном для дороги или прогулки, построение поездок по адресам с пересадками и картой, умный поиск по остановке и предупреждения о ливне, ветре и грозе в уведомлениях о погоде.`,
     "Подписка продлевается автоматически, её можно отключить в любой момент внутри мини-приложения."
   ].join("\n");
 }
@@ -1131,6 +1131,8 @@ function proWelcomeText(expiresAt, { complimentary = false, renewal = false } = 
     "• расширенные детали в уведомлениях о погоде каждые 3 часа;",
     "• персональный совет по одежде;",
     "• план погоды на 24 часа с лучшим окном для дороги или прогулки;",
+    "• построение поездок по адресам с пересадками и картой;",
+    "• умный поиск ближайших рейсов по остановке;",
     "• предупреждения о дожде, сильном ветре и грозе.",
     complimentary
       ? "Автопродление для подарочной подписки отключено."
@@ -3765,7 +3767,7 @@ function miniAppHtml() {
         </div>
         <div class="pro-card">
           <strong>✨ SkyPulse Pro</strong>
-          <p class="muted">Совет по одежде, план погоды на 24 часа с лучшим окном для дороги или прогулки и важные предупреждения о ливне, сильном ветре или грозе.</p>
+          <p class="muted">Совет по одежде, план погоды на 24 часа, построение поездок по адресам с пересадками и картой, умный поиск по остановке и важные предупреждения о погоде.</p>
           <button id="pro-weather-toggle" type="button" disabled>Проверяю доступ к Pro…</button>
           <div id="pro-weather-details" hidden>
             <div class="clothing-card">
@@ -3792,26 +3794,26 @@ function miniAppHtml() {
     </header>
 
     <section class="card">
-      <strong>🧭 Построить поездку</strong>
-      <p class="muted">Укажи адреса в Гродно. Покажем быстрые варианты, пересадки, нужные остановки и путь на карте.</p>
+      <strong>🧭 Построить поездку · Pro</strong>
+      <p class="muted">Функция SkyPulse Pro: укажи адреса в Гродно — покажем быстрые варианты, пересадки, нужные остановки и путь на карте.</p>
       <form id="trip-form" class="trip-form">
-        <input id="trip-from" type="search" maxlength="160" autocomplete="street-address" placeholder="Откуда: например, Советская 8" aria-label="Адрес отправления">
-        <input id="trip-to" type="search" maxlength="160" autocomplete="street-address" placeholder="Куда: например, ТРК Тринити" aria-label="Адрес назначения">
-        <button class="primary" type="submit">Построить маршрут</button>
+        <input id="trip-from" type="search" maxlength="160" autocomplete="street-address" placeholder="Откуда: например, Советская 8" aria-label="Адрес отправления" disabled>
+        <input id="trip-to" type="search" maxlength="160" autocomplete="street-address" placeholder="Куда: например, ТРК Тринити" aria-label="Адрес назначения" disabled>
+        <button id="trip-submit" class="primary" type="submit" disabled>🔒 Доступно в Pro</button>
       </form>
-      <div id="trip-notice" class="notice" role="status"></div>
+      <div id="trip-notice" class="notice" role="status">Проверяю доступ к Pro…</div>
       <div id="trip-result" class="trip-result" hidden></div>
       <div id="trip-map" hidden aria-label="Карта поездки"></div>
     </section>
 
     <section class="card assistant-card">
-      <strong>🤖 Умный поиск по остановке</strong>
-      <p class="muted">Напиши по‑простому: «второй автобус, остановка Автовокзал». Покажем рейсы на ближайшие 2 часа по времени Гродно — с учётом выходных и официальных нерабочих дней Беларуси.</p>
+      <strong>🤖 Умный поиск по остановке · Pro</strong>
+      <p class="muted">Функция SkyPulse Pro: напиши по‑простому «второй автобус, остановка Автовокзал» — покажем рейсы на ближайшие 2 часа по времени Гродно, с учётом выходных и официальных нерабочих дней Беларуси.</p>
       <form id="assistant-form" class="assistant-form">
-        <input id="assistant-query" type="search" maxlength="280" autocomplete="off" placeholder="Автобус 2, остановка Автовокзал" aria-label="Запрос по транспорту">
-        <button class="primary" type="submit">Найти</button>
+        <input id="assistant-query" type="search" maxlength="280" autocomplete="off" placeholder="Автобус 2, остановка Автовокзал" aria-label="Запрос по транспорту" disabled>
+        <button id="assistant-submit" class="primary" type="submit" disabled>🔒 Доступно в Pro</button>
       </form>
-      <div id="assistant-notice" class="notice" role="status"></div>
+      <div id="assistant-notice" class="notice" role="status">Проверяю доступ к Pro…</div>
       <div id="assistant-result" class="assistant-result" hidden></div>
     </section>
 
@@ -3899,11 +3901,13 @@ function miniAppHtml() {
       var proWeatherRequestId = 0;
       var assistantForm = document.getElementById("assistant-form");
       var assistantQuery = document.getElementById("assistant-query");
+      var assistantSubmit = document.getElementById("assistant-submit");
       var assistantNotice = document.getElementById("assistant-notice");
       var assistantResult = document.getElementById("assistant-result");
       var tripForm = document.getElementById("trip-form");
       var tripFrom = document.getElementById("trip-from");
       var tripTo = document.getElementById("trip-to");
+      var tripSubmit = document.getElementById("trip-submit");
       var tripNotice = document.getElementById("trip-notice");
       var tripResult = document.getElementById("trip-result");
       var tripMapElement = document.getElementById("trip-map");
@@ -4073,6 +4077,7 @@ function miniAppHtml() {
           proToggle.textContent = "🔔 Включить автопродление";
         }
         updateProWeatherToggle();
+        updateProTransportAccess();
       }
 
       function updateProWeatherToggle() {
@@ -4088,6 +4093,39 @@ function miniAppHtml() {
           proWeatherToggle.textContent = "Скрыть Pro-план";
         } else {
           proWeatherToggle.textContent = "✨ Открыть Pro-план на 24 часа";
+        }
+      }
+
+      function updateProTransportAccess() {
+        var enabled = Boolean(pro.loaded && pro.active);
+        tripFrom.disabled = !enabled;
+        tripTo.disabled = !enabled;
+        tripSubmit.disabled = !enabled;
+        assistantQuery.disabled = !enabled;
+        assistantSubmit.disabled = !enabled;
+
+        if (!pro.loaded) {
+          tripSubmit.textContent = "Проверяю доступ к Pro…";
+          assistantSubmit.textContent = "Проверяю доступ к Pro…";
+          setTripNotice("Проверяю доступ к Pro…", false);
+          setAssistantNotice("Проверяю доступ к Pro…", false);
+          return;
+        }
+        if (!enabled) {
+          tripSubmit.textContent = "🔒 Доступно в Pro";
+          assistantSubmit.textContent = "🔒 Доступно в Pro";
+          setTripNotice("🔒 Построение поездки доступно в SkyPulse Pro.", false);
+          setAssistantNotice("🔒 Умный поиск по остановке доступен в SkyPulse Pro.", false);
+          return;
+        }
+
+        tripSubmit.textContent = "Построить маршрут";
+        assistantSubmit.textContent = "Найти";
+        if (tripNotice.textContent === "Проверяю доступ к Pro…" || tripNotice.textContent === "🔒 Построение поездки доступно в SkyPulse Pro.") {
+          setTripNotice("", false);
+        }
+        if (assistantNotice.textContent === "Проверяю доступ к Pro…" || assistantNotice.textContent === "🔒 Умный поиск по остановке доступен в SkyPulse Pro.") {
+          setAssistantNotice("", false);
         }
       }
 
@@ -4633,6 +4671,10 @@ function miniAppHtml() {
       proToggle.addEventListener("click", toggleProSubscription);
       tripForm.addEventListener("submit", function (event) {
         event.preventDefault();
+        if (!pro.loaded || !pro.active) {
+          setTripNotice("🔒 Построение поездки доступно в SkyPulse Pro.", false);
+          return;
+        }
         var from = String(tripFrom.value || "").trim();
         var to = String(tripTo.value || "").trim();
         if (from.length < 3 || to.length < 3) {
@@ -4653,6 +4695,10 @@ function miniAppHtml() {
       });
       assistantForm.addEventListener("submit", function (event) {
         event.preventDefault();
+        if (!pro.loaded || !pro.active) {
+          setAssistantNotice("🔒 Умный поиск по остановке доступен в SkyPulse Pro.", false);
+          return;
+        }
         var query = String(assistantQuery.value || "").trim();
         if (query.length < 2) {
           setAssistantNotice("Напиши номер маршрута и остановку.", true);
@@ -4807,6 +4853,23 @@ async function syncProSubscription(action, chatId, extra = {}) {
   };
 }
 
+async function requireMiniAppProAccess(res, authorization) {
+  if (!authorization?.userId) {
+    miniAppError(res, 400, "This Mini App launch has no Telegram user");
+    return false;
+  }
+  if (!proPaymentsConfigured()) {
+    miniAppError(res, 503, "SkyPulse Pro is being set up");
+    return false;
+  }
+  const current = await syncProSubscription("status", authorization.userId);
+  if (!current.subscription.active) {
+    miniAppError(res, 403, "SkyPulse Pro is required for this feature");
+    return false;
+  }
+  return true;
+}
+
 function complimentaryProChargeId(userId, grantKey = null) {
   const recipient = telegramUserId(userId);
   const key = String(grantKey || "").trim().toLowerCase();
@@ -4881,7 +4944,7 @@ async function createProInvoiceLink(userId) {
   if (!proPaymentsConfigured()) throw new Error("SkyPulse Pro is not configured");
   const invoiceUrl = await telegram("createInvoiceLink", {
     title: "SkyPulse Pro",
-    description: "Умные уведомления о погоде с советом по одежде и предупреждениями.",
+    description: "Погода Pro, построение поездок и умный поиск по остановке.",
     payload: createProInvoicePayload(userId),
     currency: "XTR",
     prices: [{ label: "SkyPulse Pro · 30 дней", amount: PRO_MONTHLY_PRICE_STARS }],
@@ -5533,6 +5596,14 @@ async function handleMiniAppRequest(req, res, requestUrl) {
       return true;
     }
 
+    try {
+      if (!(await requireMiniAppProAccess(res, authorization))) return true;
+    } catch (error) {
+      console.error("Mini App Pro access check error:", error.message);
+      miniAppError(res, 502, "SkyPulse Pro is temporarily unavailable");
+      return true;
+    }
+
     let payload;
     try {
       const body = await readRequestBody(req, 16 * 1024);
@@ -5565,6 +5636,14 @@ async function handleMiniAppRequest(req, res, requestUrl) {
     }
     if (isMiniAppTripRateLimited(req, authorization)) {
       miniAppError(res, 429, "Too many route searches. Please wait a minute.");
+      return true;
+    }
+
+    try {
+      if (!(await requireMiniAppProAccess(res, authorization))) return true;
+    } catch (error) {
+      console.error("Mini App Pro access check error:", error.message);
+      miniAppError(res, 502, "SkyPulse Pro is temporarily unavailable");
       return true;
     }
 
@@ -5855,6 +5934,7 @@ module.exports = {
   parseProInvoicePayload,
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
+  proInfoText,
   proWelcomeText,
   parseComplimentaryProUsernameGifts,
   addCalendarMonthsToEpoch,
