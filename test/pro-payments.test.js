@@ -7,6 +7,10 @@ const {
   parseProInvoicePayload,
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
+  createReferralStartParameter,
+  parseReferralStartParameter,
+  referralBonusExpiry,
+  referralRewardChargeId,
   authorSupportAmount,
   createAuthorSupportInvoicePayload,
   parseAuthorSupportInvoicePayload,
@@ -45,6 +49,32 @@ test("rejects a Pro checkout when the payer or Stars amount does not match", () 
   assert.equal(proCheckoutDetails(payload, "999999", "XTR", 10, NOW, TEST_SECRET), null);
   assert.equal(proCheckoutDetails(payload, "123456", "XTR", 9, NOW, TEST_SECRET), null);
   assert.equal(proCheckoutDetails(payload, "123456", "USD", 10, NOW, TEST_SECRET), null);
+});
+
+test("signs referral deep-link parameters and rejects tampering", () => {
+  const parameter = createReferralStartParameter("123456", TEST_SECRET);
+
+  assert.match(parameter, /^ref_123456_[A-Za-z0-9_-]{32}$/);
+  assert.equal(parseReferralStartParameter(parameter, TEST_SECRET), "123456");
+  assert.equal(parseReferralStartParameter(parameter.replace(/.$/, "x"), TEST_SECRET), null);
+  assert.equal(parseReferralStartParameter("ref_123456_unsigned", TEST_SECRET), null);
+});
+
+test("extends referral rewards from the active Pro expiry without exceeding the complimentary cap", () => {
+  const oneDay = 24 * 60 * 60;
+  assert.equal(referralBonusExpiry({ active: false }, oneDay, NOW), NOW + oneDay);
+  assert.equal(
+    referralBonusExpiry({ active: true, expiresAt: NOW + 3 * oneDay }, oneDay, NOW),
+    NOW + 4 * oneDay
+  );
+
+  const cap = NOW + 11 * 366 * oneDay;
+  assert.equal(referralBonusExpiry({ active: true, expiresAt: cap - 1 }, oneDay, NOW), cap);
+  assert.equal(referralBonusExpiry({ active: true, expiresAt: cap }, oneDay, NOW), null);
+  assert.equal(
+    referralRewardChargeId("456", "123", "inviter"),
+    "complimentary-pro-456-referral-inviter-123-v1"
+  );
 });
 
 test("accepts only a valid recurring Pro payment with a Telegram payment charge", () => {

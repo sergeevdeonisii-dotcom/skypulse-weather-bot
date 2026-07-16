@@ -141,6 +141,66 @@ async function proSubscriptionStatus(env, chatId) {
   return proSubscriptionFromRow(row);
 }
 
+function referralFromRows(user, count) {
+  const invitedCount = Number(count?.invitedCount);
+  return {
+    registered: Boolean(user?.chatId),
+    linked: false,
+    referrerChatId: cleanChatId(user?.referrerChatId),
+    invitedCount: Number.isSafeInteger(invitedCount) && invitedCount >= 0 && invitedCount <= 1_000_000
+      ? invitedCount
+      : 0
+  };
+}
+
+async function referralStatus(env, chatId) {
+  const [user, count] = await Promise.all([
+    env.DB.prepare(
+      "SELECT chat_id AS chatId, referrer_chat_id AS referrerChatId FROM referral_users WHERE chat_id = ? LIMIT 1"
+    ).bind(chatId).first(),
+    env.DB.prepare(
+      "SELECT COUNT(*) AS invitedCount FROM referral_users WHERE referrer_chat_id = ?"
+    ).bind(chatId).first()
+  ]);
+  return referralFromRows(user, count);
+}
+
+async function updateReferral(request, env) {
+  if (!hasInternalSecret(request, env)) return json({ ok: false, error: "Forbidden" }, 403);
+  if (request.method !== "POST") return json({ ok: false, error: "Method not allowed" }, 405);
+
+  const payload = await requestPayload(request);
+  const action = String(payload?.action || "");
+  const chatId = cleanChatId(payload?.chatId);
+  if (!chatId || !["status", "start"].includes(action)) {
+    return json({ ok: false, error: "Invalid referral request" }, 400);
+  }
+  if (action === "status") return json({ ok: true, referral: await referralStatus(env, chatId) });
+
+  const referrerChatId = cleanChatId(payload?.referrerChatId);
+  let linked = false;
+  if (referrerChatId && referrerChatId !== chatId) {
+    // A referrer must have opened the referral screen first. This prevents an
+    // arbitrary numeric ID from being credited through a forged start payload.
+    const result = await env.DB.prepare(
+      `INSERT OR IGNORE INTO referral_users (chat_id, referrer_chat_id, started_at)
+       SELECT ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM referral_users WHERE chat_id = ?)`
+    ).bind(chatId, referrerChatId, epochSeconds(), referrerChatId).run();
+    linked = Number(result.meta?.changes) > 0;
+  }
+
+  if (!linked) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO referral_users (chat_id, referrer_chat_id, started_at)
+       VALUES (?, NULL, ?)`
+    ).bind(chatId, epochSeconds()).run();
+  }
+
+  const referral = await referralStatus(env, chatId);
+  return json({ ok: true, referral: { ...referral, linked } });
+}
+
 async function updateProSubscription(request, env) {
   if (!hasInternalSecret(request, env)) return json({ ok: false, error: "Forbidden" }, 403);
   if (request.method !== "POST") return json({ ok: false, error: "Method not allowed" }, 405);
@@ -187,6 +247,10 @@ async function updateProSubscription(request, env) {
       "SELECT telegram_payment_charge_id AS chargeId FROM pro_subscriptions WHERE chat_id = ? LIMIT 1"
     ).bind(chatId).first();
     const replaceChargeId = isFirstRecurring || !cleanPaymentChargeId(existing?.chargeId);
+    // A referral or other complimentary extension must not silently cancel a
+    // paid user's recurring subscription. New complimentary access still has
+    // auto-renewal disabled because it has no payment method attached.
+    const shouldDisableAutoRenewal = isComplimentary && replaceChargeId;
     await env.DB.prepare(
       `INSERT INTO pro_subscriptions
          (chat_id, expires_at, telegram_payment_charge_id, auto_renewing, last_payment_at, created_at, updated_at)
@@ -211,7 +275,7 @@ async function updateProSubscription(request, env) {
       epochSeconds(),
       replaceChargeId ? 1 : 0,
       shouldEnableAutoRenewal ? 1 : 0,
-      isComplimentary ? 1 : 0
+      shouldDisableAutoRenewal ? 1 : 0
     ).run();
   }
 
@@ -283,6 +347,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/health") return json({ ok: true });
     if (url.pathname === "/v1/subscriptions") return updateSubscription(request, env);
     if (url.pathname === "/v1/pro") return updateProSubscription(request, env);
+    if (url.pathname === "/v1/referrals") return updateReferral(request, env);
     return json({ ok: false, error: "Not found" }, 404);
   },
 

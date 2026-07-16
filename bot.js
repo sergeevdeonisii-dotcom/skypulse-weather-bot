@@ -40,6 +40,11 @@ const PRO_SUBSCRIPTION_PERIOD_SECONDS = 30 * 24 * 60 * 60;
 const PRO_INVOICE_TTL_SECONDS = 20 * 60;
 const AUTHOR_SUPPORT_MIN_STARS = 1;
 const AUTHOR_SUPPORT_MAX_STARS = 100;
+const REFERRAL_START_PREFIX = "ref_";
+const REFERRAL_INVITEE_REWARD_SECONDS = 24 * 60 * 60;
+const REFERRAL_INVITER_REWARD_SECONDS = 3 * 24 * 60 * 60;
+// Keep this in sync with the Cloudflare D1 guard for complimentary Pro grants.
+const MAX_COMPLIMENTARY_PRO_GRANT_SECONDS = 11 * 366 * 24 * 60 * 60;
 const PRO_PAYMENTS_ENABLED = process.env.PRO_PAYMENTS_ENABLED !== "false";
 const PRO_PAYMENT_SIGNING_SECRET = String(process.env.PRO_PAYMENT_SIGNING_SECRET || BOT_TOKEN || "");
 const PAYMENT_SUPPORT_USERNAME = String(process.env.PAYMENT_SUPPORT_USERNAME || "pitrparkeryouoi").trim().replace(/^@+/, "");
@@ -113,6 +118,8 @@ const tripPlannerCache = {
   geocodes: new Map(),
   osmNetwork: { value: null, expiresAt: 0 }
 };
+let botUsernameCache = null;
+let botUsernameRequest = null;
 let offset = 0;
 let lastStateCleanupAt = 0;
 let nominatimQueue = Promise.resolve();
@@ -212,6 +219,12 @@ function telegramUsername(value) {
   return /^[a-z][a-z0-9_]{4,31}$/.test(username) ? username : null;
 }
 
+function isPrivateUserChat(chat, from) {
+  const chatId = telegramUserId(chat?.id);
+  const userId = telegramUserId(from?.id);
+  return chat?.type === "private" && Boolean(chatId) && chatId === userId;
+}
+
 function parseComplimentaryProUsernameGifts(value) {
   const gifts = new Map();
   for (const rawGift of String(value || "").split(",")) {
@@ -256,6 +269,41 @@ function constantTimeTextEqual(left, right) {
 function proInvoiceSignature(base, signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
   if (!signingSecret) return "";
   return crypto.createHmac("sha256", signingSecret).update(base).digest("base64url").slice(0, 32);
+}
+
+function createReferralStartParameter(userId, signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const inviterId = telegramUserId(userId);
+  if (!inviterId || !signingSecret) throw new Error("Could not create a referral start parameter");
+  const base = `referral-v1.${inviterId}`;
+  const parameter = `${REFERRAL_START_PREFIX}${inviterId}_${proInvoiceSignature(base, signingSecret)}`;
+  if (parameter.length > 64) throw new Error("Referral start parameter is too long");
+  return parameter;
+}
+
+function parseReferralStartParameter(value, signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const parameter = String(value || "").trim();
+  if (!signingSecret || parameter.length > 64) return null;
+  const match = parameter.match(/^ref_(\d{1,20})_([A-Za-z0-9_-]{32})$/);
+  if (!match) return null;
+  const inviterId = telegramUserId(match[1]);
+  if (!inviterId) return null;
+  const expected = proInvoiceSignature(`referral-v1.${inviterId}`, signingSecret);
+  return constantTimeTextEqual(match[2], expected) ? inviterId : null;
+}
+
+function startParameterFromText(text) {
+  const parts = String(text || "").trim().split(/\s+/);
+  return parts.length === 2 ? parts[1] : null;
+}
+
+function referralBonusExpiry(subscription, rewardSeconds, nowSeconds = Math.floor(Date.now() / 1000)) {
+  const now = Number(nowSeconds);
+  const bonus = Number(rewardSeconds);
+  if (!Number.isSafeInteger(now) || now <= 0 || !Number.isSafeInteger(bonus) || bonus <= 0) return null;
+  const activeExpiry = subscription?.active === true ? Number(subscription.expiresAt) : 0;
+  const base = Number.isSafeInteger(activeExpiry) && activeExpiry > now ? activeExpiry : now;
+  const expiresAt = Math.min(now + MAX_COMPLIMENTARY_PRO_GRANT_SECONDS, base + bonus);
+  return expiresAt > base ? expiresAt : null;
 }
 
 function createProInvoicePayload(userId, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
@@ -771,6 +819,7 @@ function menuKeyboard(lang) {
         { text: LABELS[lang].language, callback_data: "choose_lang" }
       ],
       [{ text: lang === "en" ? "✨ SkyPulse Pro" : "✨ SkyPulse Pro", callback_data: "pro" }],
+      [{ text: lang === "en" ? "🎁 Invite a friend (+3 days Pro)" : "🎁 Пригласить друга (+3 дня Pro)", callback_data: "referral" }],
       [{ text: lang === "en" ? "💛 Support the author" : "💛 Поддержать автора", callback_data: "support_author" }],
       [{ text: lang === "en" ? "ℹ️ Information" : "ℹ️ Информация", callback_data: "info_menu" }]
     ]
@@ -908,6 +957,7 @@ function proInfoText(lang) {
       "• 🤖 Smart search for the nearest departures at a stop",
       "• ⚠️ Rain, strong-wind and thunderstorm alerts",
       "",
+      "🎁 Invite a new friend: they get 1 day of Pro, you get +3 days of Pro.",
       "🔁 Renews automatically. Cancel any time in the Mini App."
     ].join("\n");
   }
@@ -923,6 +973,7 @@ function proInfoText(lang) {
     "• 🤖 Умный поиск ближайших рейсов по остановке",
     "• ⚠️ Предупреждения о ливне, сильном ветре и грозе",
     "",
+    "🎁 Пригласи нового друга: ему 1 день Pro, тебе +3 дня Pro.",
     "🔁 Подписка продлевается автоматически. Отключить её можно в любой момент в мини‑приложении."
   ].join("\n");
 }
@@ -935,6 +986,7 @@ function proInfoKeyboard(lang) {
         ? { text: lang === "en" ? "✨ Open SkyPulse Pro" : "✨ Открыть SkyPulse Pro", web_app: { url } }
         : { text: lang === "en" ? "🚌 Open Mini App" : "🚌 Открыть мини-приложение", callback_data: "transport_menu" }
       ],
+      [{ text: lang === "en" ? "🎁 Invite a friend" : "🎁 Пригласить друга", callback_data: "referral" }],
       [{ text: lang === "en" ? "💛 Support the author" : "💛 Поддержать автора", callback_data: "support_author" }],
       [{ text: lang === "en" ? "💳 Payment support" : "💳 Поддержка по оплате", callback_data: "paysupport" }]
     ]
@@ -1168,6 +1220,120 @@ async function sendMessage(chatId, text, extra = {}) {
     parse_mode: "HTML",
     ...extra
   });
+}
+
+async function getBotUsername() {
+  const configured = telegramUsername(process.env.BOT_USERNAME);
+  if (configured) return configured;
+  if (botUsernameCache) return botUsernameCache;
+  if (!BOT_TOKEN) return null;
+  if (!botUsernameRequest) {
+    botUsernameRequest = telegram("getMe", {})
+      .then((bot) => telegramUsername(bot?.username))
+      .catch((error) => {
+        console.error("Could not load Telegram bot username:", error.message);
+        return null;
+      })
+      .finally(() => {
+        botUsernameRequest = null;
+      });
+  }
+  const username = await botUsernameRequest;
+  if (username) botUsernameCache = username;
+  return username;
+}
+
+function referralLink(botUsername, inviterId) {
+  const username = telegramUsername(botUsername);
+  const userId = telegramUserId(inviterId);
+  if (!username || !userId) return null;
+  return `https://t.me/${username}?start=${createReferralStartParameter(userId)}`;
+}
+
+function referralShareUrl(link, lang) {
+  const share = new URL("https://t.me/share/url");
+  share.searchParams.set("url", link);
+  share.searchParams.set("text", lang === "en"
+    ? "Try SkyPulse — weather and Grodno transport. Get 1 day of Pro as a gift!"
+    : "Попробуй SkyPulse — погода и транспорт Гродно. Получи 1 день Pro в подарок!");
+  return share.toString();
+}
+
+function safeReferralCount(value) {
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 && count <= 1_000_000 ? count : 0;
+}
+
+function referralProgramText(lang, link, invitedCount = 0) {
+  const count = safeReferralCount(invitedCount);
+  if (lang === "en") {
+    return [
+      "<b>🎁 Invite friends</b>",
+      "",
+      "Send this personal link to a friend:",
+      `<code>${escapeHtml(link)}</code>`,
+      "",
+      "A new user gets <b>1 day of SkyPulse Pro</b> after starting the bot. You get <b>+3 days of Pro</b> for each friend.",
+      `Friends invited: <b>${count}</b>`,
+      "",
+      "One reward per new Telegram account. Self-referrals and repeated starts do not count."
+    ].join("\n");
+  }
+  return [
+    "<b>🎁 Пригласи друзей</b>",
+    "",
+    "Отправь другу свою личную ссылку:",
+    `<code>${escapeHtml(link)}</code>`,
+    "",
+    "Новый пользователь после запуска бота получит <b>1 день SkyPulse Pro</b>. За каждого друга тебе добавится <b>+3 дня Pro</b>.",
+    `Приглашено друзей: <b>${count}</b>`,
+    "",
+    "Одна награда за новый Telegram-аккаунт. Саморефералы и повторные запуски не засчитываются."
+  ].join("\n");
+}
+
+function referralKeyboard(lang, link) {
+  return {
+    inline_keyboard: [
+      [{
+        text: lang === "en" ? "📤 Share the link" : "📤 Поделиться ссылкой",
+        url: referralShareUrl(link, lang)
+      }],
+      [{ text: lang === "en" ? "← Menu" : "← В меню", callback_data: "menu" }]
+    ]
+  };
+}
+
+async function showReferralProgram(chatId) {
+  const lang = langOf(chatId);
+  if (!proPaymentsConfigured()) {
+    await sendMessage(chatId, lang === "en"
+      ? "The referral program is being set up. Try again a little later."
+      : "Реферальная программа сейчас настраивается. Попробуй чуть позже.", {
+        reply_markup: menuKeyboard(lang)
+      });
+    return;
+  }
+
+  try {
+    const [referral, botUsername] = await Promise.all([
+      syncReferral("start", chatId),
+      getBotUsername()
+    ]);
+    const link = referralLink(botUsername, chatId);
+    if (!link) throw new Error("Telegram bot username is unavailable");
+    await sendMessage(chatId, referralProgramText(lang, link, referral.invitedCount), {
+      reply_markup: referralKeyboard(lang, link),
+      disable_web_page_preview: true
+    });
+  } catch (error) {
+    console.error("Could not open referral program:", error.message);
+    await sendMessage(chatId, lang === "en"
+      ? "Could not prepare your referral link right now. Try again in a moment."
+      : "Не удалось подготовить твою реферальную ссылку. Попробуй ещё раз через минуту.", {
+        reply_markup: menuKeyboard(lang)
+      });
+  }
 }
 
 function authorSupportPromptText(lang) {
@@ -3371,6 +3537,19 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
+  if (data === "referral") {
+    if (!isPrivateUserChat(callbackQuery.message?.chat, callbackQuery.from)) {
+      await sendMessage(chatId, lang === "en"
+        ? "Open the referral program in the bot's private chat."
+        : "Открой реферальную программу в личном чате с ботом.", {
+          reply_markup: menuKeyboard(lang)
+        });
+      return;
+    }
+    await showReferralProgram(chatId);
+    return;
+  }
+
   if (data === "support_author") {
     await askForAuthorSupport(chatId);
     return;
@@ -3634,8 +3813,27 @@ async function handleMessage(message) {
   }
 
   if (command === "/start") {
+    const isPrivateStart = isPrivateUserChat(message.chat, message.from);
+    const inviterId = isPrivateStart
+      ? parseReferralStartParameter(startParameterFromText(text))
+      : null;
     resetToMenu(chatId);
     await sendLanguageChoice(chatId);
+    if (isPrivateStart && proPaymentsConfigured()) {
+      try {
+        if (inviterId) {
+          await processReferralStart(chatId, inviterId);
+        } else {
+          // Every ordinary private /start is recorded too, so a user cannot
+          // start first and later claim a referral reward as a "new" account.
+          await syncReferral("start", chatId);
+        }
+      } catch (error) {
+        // The user can still use the bot if the referral service is briefly down.
+        // Reopening the same signed link later safely retries the deterministic reward.
+        console.error("Could not process referral start:", error.message);
+      }
+    }
     return;
   }
 
@@ -5061,6 +5259,135 @@ async function syncProSubscription(action, chatId, extra = {}) {
   };
 }
 
+function referralFromWorker(value) {
+  const referrerChatId = telegramUserId(value?.referrerChatId);
+  const invitedCount = safeReferralCount(value?.invitedCount);
+  return {
+    registered: value?.registered === true,
+    linked: value?.linked === true,
+    referrerChatId,
+    invitedCount
+  };
+}
+
+async function syncReferral(action, chatId, referrerChatId = null) {
+  if (!proPaymentsConfigured()) throw new Error("SkyPulse Pro is not configured");
+  const userId = telegramUserId(chatId);
+  const inviterId = referrerChatId == null ? null : telegramUserId(referrerChatId);
+  if (!userId || !["status", "start"].includes(action)) {
+    throw new Error("Invalid referral request");
+  }
+  const response = await fetchJson(`${WEATHER_NOTIFICATIONS_WORKER_URL}/v1/referrals`, {
+    method: "POST",
+    timeoutMs: 12000,
+    maxBytes: 64 * 1024,
+    label: "SkyPulse referral program",
+    headers: {
+      "Content-Type": "application/json",
+      "X-SkyPulse-Notification-Secret": WEATHER_NOTIFICATIONS_SHARED_SECRET
+    },
+    body: JSON.stringify({ action, chatId: userId, ...(inviterId ? { referrerChatId: inviterId } : {}) })
+  });
+  if (!response?.ok || !response.referral) {
+    throw new Error("SkyPulse referral service returned an invalid response");
+  }
+  return referralFromWorker(response.referral);
+}
+
+function referralRewardChargeId(recipientId, inviteeId, role) {
+  const recipient = telegramUserId(recipientId);
+  const invitee = telegramUserId(inviteeId);
+  if (!recipient || !invitee || !["inviter", "invitee"].includes(role)) {
+    throw new Error("Invalid referral reward");
+  }
+  return complimentaryProChargeId(recipient, `referral-${role}-${invitee}`);
+}
+
+async function grantReferralProReward(recipientId, inviteeId, role) {
+  const rewardSeconds = role === "inviter"
+    ? REFERRAL_INVITER_REWARD_SECONDS
+    : role === "invitee"
+      ? REFERRAL_INVITEE_REWARD_SECONDS
+      : 0;
+  if (!rewardSeconds) throw new Error("Invalid referral reward role");
+
+  const current = await syncProSubscription("status", recipientId);
+  const expiresAt = referralBonusExpiry(current.subscription, rewardSeconds);
+  if (!expiresAt) {
+    return { granted: false, capped: true, subscription: current.subscription };
+  }
+
+  const result = await syncProSubscription("grant", recipientId, {
+    expiresAt,
+    chargeId: referralRewardChargeId(recipientId, inviteeId, role),
+    isFirstRecurring: false
+  });
+  return {
+    granted: result.newPayment === true,
+    capped: false,
+    subscription: result.subscription,
+    expiresAt: result.subscription.expiresAt || expiresAt
+  };
+}
+
+function referralInviteeRewardText(lang, expiresAt) {
+  const ending = escapeHtml(formatProExpiration(expiresAt));
+  if (lang === "en") {
+    return [
+      "<b>🎉 You received 1 day of SkyPulse Pro!</b>",
+      `Your gift is active until ${ending}.`,
+      "You can now use the Pro weather plan, trip planner and smart stop search."
+    ].join("\n");
+  }
+  return [
+    "<b>🎉 Тебе подарили 1 день SkyPulse Pro!</b>",
+    `Подарок активен до ${ending}.`,
+    "Теперь доступны Pro-план погоды, построение поездки и умный поиск по остановке."
+  ].join("\n");
+}
+
+function referralInviterRewardText(lang, expiresAt) {
+  const ending = escapeHtml(formatProExpiration(expiresAt));
+  if (lang === "en") {
+    return [
+      "<b>🎉 Your friend joined through your link!</b>",
+      `<b>+3 days of SkyPulse Pro</b> have been added. Active until ${ending}.`
+    ].join("\n");
+  }
+  return [
+    "<b>🎉 Друг присоединился по твоей ссылке!</b>",
+    `<b>+3 дня SkyPulse Pro</b> уже добавлены. Подписка активна до ${ending}.`
+  ].join("\n");
+}
+
+async function processReferralStart(inviteeChatId, inviterChatId) {
+  const inviteeId = telegramUserId(inviteeChatId);
+  const inviterId = telegramUserId(inviterChatId);
+  if (!inviteeId || !inviterId || inviteeId === inviterId) return false;
+
+  const referral = await syncReferral("start", inviteeId, inviterId);
+  // A saved link is retried safely after a transient failure: both Pro grants
+  // use deterministic charge IDs, so D1 can never credit the same friend twice.
+  if (referral.referrerChatId !== inviterId) return false;
+
+  const [inviteeReward, inviterReward] = await Promise.all([
+    grantReferralProReward(inviteeId, inviteeId, "invitee"),
+    grantReferralProReward(inviterId, inviteeId, "inviter")
+  ]);
+
+  if (inviteeReward.granted) {
+    await sendMessage(inviteeId, referralInviteeRewardText(langOf(inviteeId), inviteeReward.expiresAt), {
+      reply_markup: menuKeyboard(langOf(inviteeId))
+    });
+  }
+  if (inviterReward.granted) {
+    await sendMessage(inviterId, referralInviterRewardText(langOf(inviterId), inviterReward.expiresAt), {
+      reply_markup: menuKeyboard(langOf(inviterId))
+    });
+  }
+  return inviteeReward.granted || inviterReward.granted;
+}
+
 async function requireMiniAppProAccess(res, authorization) {
   if (!authorization?.userId) {
     miniAppError(res, 400, "This Mini App launch has no Telegram user");
@@ -6142,6 +6469,10 @@ module.exports = {
   parseProInvoicePayload,
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
+  createReferralStartParameter,
+  parseReferralStartParameter,
+  referralBonusExpiry,
+  referralRewardChargeId,
   authorSupportAmount,
   createAuthorSupportInvoicePayload,
   parseAuthorSupportInvoicePayload,

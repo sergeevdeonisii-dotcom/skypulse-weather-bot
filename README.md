@@ -45,6 +45,18 @@ or messages the bot. The recipient then receives the usual Pro confirmation from
 the bot. Usernames are matched case-insensitively without `@`; keep this setting in
 Render rather than the repository.
 
+## Referral program
+
+The bot menu has **Invite a friend**. It generates a signed Telegram deep link for
+the current user; a new friend who starts through that link receives one day of
+SkyPulse Pro, while the inviter receives three days. The link is signed server-side,
+self-referrals are rejected, and a Telegram account can be credited only once.
+
+Referral registrations are stored in the existing Cloudflare D1 database. Deploy
+the `0003_referrals.sql` migration and the Worker before publishing the bot update.
+`BOT_USERNAME` is optional: when omitted, the bot safely obtains its public username
+from Telegram before it creates a link.
+
 ## Smart transport search
 
 The Mini App shows departures for the next two hours in Grodno time. It switches to the weekend timetable on Saturdays, Sundays, Belarusian statutory non-working holidays (including Radunitsa), and officially transferred days off.
