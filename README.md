@@ -2,6 +2,17 @@
 
 Telegram bot with weather, outfit advice, and Grodno public transport schedules.
 
+## AI psychologist
+
+The Mini App has a **Psychologist** tab for a supportive, non-clinical conversation.
+It uses Gemini through the server-side `GEMINI_API_KEY`; the API key is never sent
+to the Telegram client. The bot does not persist the conversation itself, and the
+page keeps only a short in-memory context while it is open.
+
+It is not an emergency or medical service. Messages that signal an immediate risk
+of self-harm or harm to another person receive a local crisis response rather than
+being forwarded to Gemini.
+
 ## Smart transport search
 
 The Mini App shows departures for the next two hours in Grodno time. It switches to the weekend timetable on Saturdays, Sundays, Belarusian statutory non-working holidays (including Radunitsa), and officially transferred days off.
