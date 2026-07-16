@@ -78,6 +78,8 @@ const NOMINATIM_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
 const OSM_NETWORK_CACHE_MS = 12 * 60 * 60 * 1000;
 const WEATHER_CACHE_MS = 5 * 60 * 1000;
 const WEATHER_STALE_CACHE_MS = 60 * 60 * 1000;
+const MINI_APP_WEATHER_SNAPSHOT_TTL_MS = 20 * 60 * 1000;
+const MAX_MINI_APP_WEATHER_SNAPSHOTS = 300;
 const OSM_OVERPASS_URL = process.env.OSM_OVERPASS_URL || "https://maps.mail.ru/osm/tools/overpass/api/interpreter";
 const OSM_NOMINATIM_URL = process.env.OSM_NOMINATIM_URL || "https://nominatim.openstreetmap.org/search";
 const OSM_USER_AGENT = "SkyPulseWeatherBot/1.0 (https://t.me/SkyPulseWeatherBot)";
@@ -95,6 +97,7 @@ const miniAppTripRateBuckets = new Map();
 const userPreferences = new Map();
 const weatherCache = new Map();
 const weatherRequests = new Map();
+const miniAppWeatherSnapshots = new Map();
 const transportCache = {
   routes: { value: null, expiresAt: 0 },
   stops: { value: null, expiresAt: 0 },
@@ -434,6 +437,10 @@ function cleanupRuntimeState(now = Date.now()) {
 
   for (const [key, cached] of weatherCache.entries()) {
     if (!cached?.staleAt || cached.staleAt < now) weatherCache.delete(key);
+  }
+
+  for (const [token, snapshot] of miniAppWeatherSnapshots.entries()) {
+    if (!snapshot?.expiresAt || snapshot.expiresAt < now) miniAppWeatherSnapshots.delete(token);
   }
 
   for (const [key, cached] of transportCache.routePages.entries()) {
@@ -3888,7 +3895,7 @@ function miniAppHtml() {
       var proWeatherNotice = document.getElementById("pro-weather-notice");
       var proWeatherWindow = document.getElementById("pro-weather-window");
       var proHourlyList = document.getElementById("pro-hourly-list");
-      var proWeather = { city: "", loadedCity: "", busy: false };
+      var proWeather = { city: "", weatherToken: "", loadedCity: "", busy: false };
       var proWeatherRequestId = 0;
       var assistantForm = document.getElementById("assistant-form");
       var assistantQuery = document.getElementById("assistant-query");
@@ -4132,7 +4139,7 @@ function miniAppHtml() {
         proWeather.busy = true;
         updateProWeatherToggle();
         setProWeatherNotice("Готовлю персональный план погоды…", false);
-        postJson("/api/pro", { action: "weather_details", city: proWeather.city }).then(function (data) {
+        postJson("/api/pro", { action: "weather_details", city: proWeather.city, weatherToken: proWeather.weatherToken }).then(function (data) {
           if (requestId !== proWeatherRequestId || !data.details) return;
           renderProWeatherDetails(data.details);
           proWeather.loadedCity = String(data.details.city || proWeather.city);
@@ -4264,7 +4271,7 @@ function miniAppHtml() {
         }
       }
 
-      function renderWeather(weather) {
+      function renderWeather(weather, weatherToken) {
         weatherCityTitle.textContent = weather.city;
         weatherNow.textContent = weather.current.emoji + " " + String(weather.current.temperature) + "°C, " + weather.current.description;
         weatherDetails.textContent = "Ощущается как " + String(weather.current.apparent) + "°C · Ветер " + String(weather.current.wind) + " км/ч";
@@ -4286,6 +4293,7 @@ function miniAppHtml() {
         });
         proWeatherRequestId += 1;
         proWeather.city = String(weather.city || "");
+        proWeather.weatherToken = String(weatherToken || "");
         proWeather.busy = false;
         clearProWeatherDetails();
         setProWeatherNotice("", false);
@@ -4488,7 +4496,7 @@ function miniAppHtml() {
         }
         setWeatherNotice("Загружаю погоду…", false);
         request("/api/weather?city=" + encodeURIComponent(query)).then(function (data) {
-          renderWeather(data.weather);
+          renderWeather(data.weather, data.weatherToken);
           weatherCityInput.value = data.weather.city.split(",")[0] || query;
           try { localStorage.setItem("skypulse-city", weatherCityInput.value); } catch (_) {}
           setWeatherNotice("", false);
@@ -4686,6 +4694,52 @@ function miniAppIndex(value, size) {
 function miniAppCityQuery(value) {
   const city = String(value || "").trim();
   return city.length >= 2 && city.length <= 100 && !/[\r\n\u0000]/.test(city) ? city : null;
+}
+
+function miniAppWeatherSnapshotCityKey(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLocaleLowerCase("ru");
+}
+
+function rememberMiniAppWeatherSnapshot(userId, city, weather, observedCurrent = null, now = Date.now()) {
+  const ownerId = telegramUserId(userId);
+  const cityName = formatCityName(city);
+  const cityKey = miniAppWeatherSnapshotCityKey(cityName);
+  if (!ownerId || !cityKey || !weather || typeof weather !== "object") return null;
+
+  let token;
+  do {
+    token = crypto.randomBytes(24).toString("hex");
+  } while (miniAppWeatherSnapshots.has(token));
+
+  miniAppWeatherSnapshots.set(token, {
+    userId: ownerId,
+    cityKey,
+    city,
+    weather,
+    observedCurrent,
+    expiresAt: now + MINI_APP_WEATHER_SNAPSHOT_TTL_MS
+  });
+
+  while (miniAppWeatherSnapshots.size > MAX_MINI_APP_WEATHER_SNAPSHOTS) {
+    const oldestToken = miniAppWeatherSnapshots.keys().next().value;
+    if (!oldestToken) break;
+    miniAppWeatherSnapshots.delete(oldestToken);
+  }
+  return token;
+}
+
+function readMiniAppWeatherSnapshot(tokenValue, userId, cityQuery, now = Date.now()) {
+  const token = String(tokenValue || "").trim();
+  const ownerId = telegramUserId(userId);
+  if (!ownerId || !/^[a-f0-9]{48}$/i.test(token)) return null;
+
+  const snapshot = miniAppWeatherSnapshots.get(token);
+  if (!snapshot || snapshot.expiresAt < now) {
+    miniAppWeatherSnapshots.delete(token);
+    return null;
+  }
+  if (snapshot.userId !== ownerId || snapshot.cityKey !== miniAppWeatherSnapshotCityKey(cityQuery)) return null;
+  return snapshot;
 }
 
 function miniAppNotificationAction(value) {
@@ -5116,13 +5170,18 @@ function miniAppProWeatherDetails(city, weather, observedCurrent = null) {
   };
 }
 
-async function getMiniAppWeather(cityQuery) {
+async function loadMiniAppWeather(cityQuery) {
   const city = await findCity(cityQuery, "ru");
   if (!city) return null;
 
   const weather = await getWeather(city);
   const observedCurrent = await miniAppObservedCurrent(city, weather);
-  return miniAppWeatherPayload(city, weather, observedCurrent);
+  return { city, weather, observedCurrent };
+}
+
+async function getMiniAppWeather(cityQuery) {
+  const loaded = await loadMiniAppWeather(cityQuery);
+  return loaded ? miniAppWeatherPayload(loaded.city, loaded.weather, loaded.observedCurrent) : null;
 }
 
 async function getMiniAppProWeatherDetails(cityQuery) {
@@ -5373,7 +5432,10 @@ async function handleMiniAppRequest(req, res, requestUrl) {
           miniAppError(res, 400, "Invalid city");
           return true;
         }
-        const details = await getMiniAppProWeatherDetails(city);
+        const snapshot = readMiniAppWeatherSnapshot(payload?.weatherToken, authorization.userId, city);
+        const details = snapshot
+          ? miniAppProWeatherDetails(snapshot.city, snapshot.weather, snapshot.observedCurrent)
+          : await getMiniAppProWeatherDetails(city);
         if (!details) {
           miniAppError(res, 404, "City was not found");
           return true;
@@ -5547,12 +5609,19 @@ async function handleMiniAppRequest(req, res, requestUrl) {
       return true;
     }
     try {
-      const weather = await getMiniAppWeather(cityQuery);
-      if (!weather) {
+      const loaded = await loadMiniAppWeather(cityQuery);
+      if (!loaded) {
         miniAppError(res, 404, "City not found");
         return true;
       }
-      sendJson(res, 200, { ok: true, weather });
+      const weather = miniAppWeatherPayload(loaded.city, loaded.weather, loaded.observedCurrent);
+      const weatherToken = rememberMiniAppWeatherSnapshot(
+        authorization?.userId,
+        loaded.city,
+        loaded.weather,
+        loaded.observedCurrent
+      );
+      sendJson(res, 200, { ok: true, weather, weatherToken });
       return true;
     } catch (error) {
       console.error("Mini App weather error:", error.message);
@@ -5777,6 +5846,8 @@ module.exports = {
   miniAppNotificationAction,
   miniAppWeatherPayload,
   miniAppProWeatherDetails,
+  rememberMiniAppWeatherSnapshot,
+  readMiniAppWeatherSnapshot,
   metNoForecastPayload,
   weatherNotificationSubscriber,
   formatWeatherNotification,

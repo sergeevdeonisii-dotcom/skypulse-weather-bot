@@ -13,6 +13,8 @@ const {
   complimentaryProChargeId,
   miniAppWeatherPayload,
   miniAppProWeatherDetails,
+  rememberMiniAppWeatherSnapshot,
+  readMiniAppWeatherSnapshot,
   metNoForecastPayload,
   formatWeatherNotification,
   weatherNotificationSubscriber
@@ -113,6 +115,22 @@ test("keeps outfit advice and the 24-hour plan out of the Free weather payload",
   assert.equal(pro.hours.length, 24);
   assert.equal(pro.hours[0].time, "09:00");
   assert.match(pro.comfortWindow, /Лучшее окно/);
+});
+
+test("reuses a freshly loaded weather snapshot only for its Pro owner and city", () => {
+  const city = { name: "Grodno", country: "Belarus" };
+  const weather = { marker: "forecast" };
+  const observedCurrent = { temperature_2m: 22 };
+  const now = 1_800_000_000_000;
+  const token = rememberMiniAppWeatherSnapshot("123456", city, weather, observedCurrent, now);
+
+  assert.match(token, /^[a-f0-9]{48}$/);
+  const snapshot = readMiniAppWeatherSnapshot(token, "123456", "Grodno, Belarus", now + 1);
+  assert.equal(snapshot.weather, weather);
+  assert.equal(snapshot.observedCurrent, observedCurrent);
+  assert.equal(readMiniAppWeatherSnapshot(token, "654321", "Grodno, Belarus", now + 1), null);
+  assert.equal(readMiniAppWeatherSnapshot(token, "123456", "Minsk, Belarus", now + 1), null);
+  assert.equal(readMiniAppWeatherSnapshot(token, "123456", "Grodno, Belarus", now + 21 * 60 * 1000), null);
 });
 
 test("converts MET Norway hourly data into the shared weather forecast shape", () => {
