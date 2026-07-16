@@ -13,6 +13,17 @@ It is not an emergency or medical service. Messages that signal an immediate ris
 of self-harm or harm to another person receive a local crisis response rather than
 being forwarded to Gemini.
 
+## Scheduled weather notifications
+
+The Weather tab can opt a Telegram user in to an update every three hours. The
+schedule runs in `cloudflare-weather-notifications`, a Cloudflare Worker with a
+D1 database. The Worker stores only the Telegram chat ID, selected city, and the
+last successful delivery time. It wakes Render only when an update is due, so the
+feature keeps working while the Free Render web service is asleep.
+
+The two services authenticate each other with the `WEATHER_NOTIFICATIONS_SHARED_SECRET`
+environment variable. Keep that value in platform secrets only; never commit it.
+
 ## Smart transport search
 
 The Mini App shows departures for the next two hours in Grodno time. It switches to the weekend timetable on Saturdays, Sundays, Belarusian statutory non-working holidays (including Radunitsa), and officially transferred days off.

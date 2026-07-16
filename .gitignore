@@ -4,3 +4,4 @@ npm-debug.log*
 *.log
 *.err.log
 data/
+cloudflare-weather-notifications/.wrangler/

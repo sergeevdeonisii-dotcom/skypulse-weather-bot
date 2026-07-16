@@ -30,6 +30,9 @@ const MINI_APP_PATH = "/transport";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GEMINI_TOKEN || process.env.GEMINI_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const MINI_APP_ALLOW_LOCAL_UNVERIFIED = process.env.MINI_APP_ALLOW_LOCAL_UNVERIFIED === "true";
+const WEATHER_NOTIFICATIONS_WORKER_URL = String(process.env.WEATHER_NOTIFICATIONS_WORKER_URL || "").trim().replace(/\/$/, "");
+const WEATHER_NOTIFICATIONS_SHARED_SECRET = String(process.env.WEATHER_NOTIFICATIONS_SHARED_SECRET || "").trim();
+const WEATHER_NOTIFICATIONS_DELIVERY_PATH = "/internal/weather-notifications/deliver";
 const GRODNO_TIME_ZONE = "Europe/Minsk";
 const BELARUS_WEEKEND_SERVICE_DATES = configuredWeekendServiceDates(process.env.BELARUS_WEEKEND_SERVICE_DATES);
 const MAX_MESSAGE_TEXT_LENGTH = 160;
@@ -52,6 +55,9 @@ const MINI_APP_PSYCHOLOGY_MAX_REQUESTS = 6;
 const MINI_APP_PSYCHOLOGY_MAX_MESSAGES = 9;
 const MINI_APP_PSYCHOLOGY_MAX_MESSAGE_LENGTH = 1200;
 const MINI_APP_PSYCHOLOGY_MAX_TOTAL_LENGTH = 7200;
+const MINI_APP_NOTIFICATION_WINDOW_MS = 60 * 1000;
+const MINI_APP_NOTIFICATION_MAX_REQUESTS = 8;
+const WEATHER_NOTIFICATION_MAX_RECIPIENTS = 30;
 const MINI_APP_TRIP_WINDOW_MS = 60 * 1000;
 const MINI_APP_TRIP_MAX_REQUESTS = 4;
 const MINI_APP_INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60;
@@ -70,6 +76,7 @@ const rateBuckets = new Map();
 const miniAppApiRateBuckets = new Map();
 const miniAppAiRateBuckets = new Map();
 const miniAppPsychologyRateBuckets = new Map();
+const miniAppNotificationRateBuckets = new Map();
 const miniAppTripRateBuckets = new Map();
 const userPreferences = new Map();
 const transportCache = {
@@ -147,7 +154,8 @@ function validateMiniAppInitData(rawInitData) {
 
   try {
     const user = JSON.parse(params.get("user") || "{}");
-    if (user?.id) return { key: `telegram:${user.id}` };
+    const userId = String(user?.id || "");
+    if (/^\d{1,20}$/.test(userId)) return { key: `telegram:${userId}`, userId };
   } catch {
     // A valid Mini App request can omit user data in some launch contexts.
   }
@@ -198,6 +206,17 @@ function isMiniAppPsychologyRateLimited(req, authorization) {
   fresh.push(now);
   miniAppPsychologyRateBuckets.set(key, fresh);
   return fresh.length > MINI_APP_PSYCHOLOGY_MAX_REQUESTS;
+}
+
+function isMiniAppNotificationRateLimited(req, authorization) {
+  const now = Date.now();
+  cleanupRuntimeState(now);
+  const key = miniAppClientKey(req, authorization);
+  const bucket = miniAppNotificationRateBuckets.get(key) || [];
+  const fresh = bucket.filter((time) => now - time < MINI_APP_NOTIFICATION_WINDOW_MS);
+  fresh.push(now);
+  miniAppNotificationRateBuckets.set(key, fresh);
+  return fresh.length > MINI_APP_NOTIFICATION_MAX_REQUESTS;
 }
 
 function isMiniAppTripRateLimited(req, authorization) {
@@ -255,6 +274,15 @@ function cleanupRuntimeState(now = Date.now()) {
       miniAppPsychologyRateBuckets.set(key, fresh);
     } else {
       miniAppPsychologyRateBuckets.delete(key);
+    }
+  }
+
+  for (const [key, bucket] of miniAppNotificationRateBuckets.entries()) {
+    const fresh = bucket.filter((time) => now - time < MINI_APP_NOTIFICATION_WINDOW_MS);
+    if (fresh.length) {
+      miniAppNotificationRateBuckets.set(key, fresh);
+    } else {
+      miniAppNotificationRateBuckets.delete(key);
     }
   }
 
@@ -3152,6 +3180,52 @@ function miniAppError(res, statusCode, message) {
   sendJson(res, statusCode, { ok: false, error: message });
 }
 
+function weatherNotificationSecretMatches(value) {
+  if (!WEATHER_NOTIFICATIONS_SHARED_SECRET || typeof value !== "string") return false;
+  const expected = Buffer.from(WEATHER_NOTIFICATIONS_SHARED_SECRET);
+  const received = Buffer.from(value);
+  return received.length === expected.length && crypto.timingSafeEqual(received, expected);
+}
+
+async function handleWeatherNotificationDelivery(req, res) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { ok: false, error: "Method not allowed" });
+    return;
+  }
+  if (!weatherNotificationSecretMatches(String(req.headers["x-skypulse-notification-secret"] || ""))) {
+    sendJson(res, 403, { ok: false, error: "Forbidden" });
+    return;
+  }
+
+  let payload;
+  try {
+    const body = await readRequestBody(req, 16 * 1024);
+    payload = JSON.parse(body);
+  } catch (error) {
+    sendJson(res, error?.message === "Request body too large" ? 413 : 400, { ok: false, error: "Invalid request" });
+    return;
+  }
+
+  const input = Array.isArray(payload?.subscribers) ? payload.subscribers : null;
+  if (!input || input.length > WEATHER_NOTIFICATION_MAX_RECIPIENTS) {
+    sendJson(res, 400, { ok: false, error: "Invalid subscribers" });
+    return;
+  }
+  const subscribers = input.map(weatherNotificationSubscriber);
+  if (subscribers.some((subscriber) => !subscriber)) {
+    sendJson(res, 400, { ok: false, error: "Invalid subscriber" });
+    return;
+  }
+
+  try {
+    const result = await deliverWeatherNotificationBatch(subscribers);
+    sendJson(res, 200, { ok: true, ...result });
+  } catch (error) {
+    console.error("Weather notification batch failed:", error.message);
+    sendJson(res, 502, { ok: false, error: "Weather notifications are unavailable" });
+  }
+}
+
 function miniAppHtml() {
   return `<!doctype html>
 <html lang="ru">
@@ -3212,6 +3286,9 @@ function miniAppHtml() {
     .clothing-toggle { width: 100%; margin-top: 12px; }
     .clothing-card { padding: 12px; margin-top: 10px; border: 1px solid var(--border); border-radius: 13px; }
     .clothing-card p { margin-top: 8px; }
+    .weather-notification-card { padding: 12px; margin-top: 12px; border: 1px solid var(--border); border-radius: 13px; }
+    .weather-notification-card p { margin-top: 7px; }
+    .weather-notification-card button { width: 100%; margin-top: 10px; }
     .assistant-card { margin-top: 16px; }
     .assistant-form { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin-top: 12px; }
     .assistant-result { margin-top: 10px; }
@@ -3272,6 +3349,12 @@ function miniAppHtml() {
           <p id="clothing-base"></p>
           <p id="clothing-shoes"></p>
           <p id="clothing-extra" class="muted"></p>
+        </div>
+        <div class="weather-notification-card">
+          <strong>🔔 Погода каждые 3 часа</strong>
+          <p class="muted">Бот будет присылать текущую погоду в личный чат. Подписку можно выключить в любой момент.</p>
+          <button id="weather-notification-toggle" type="button" disabled>Проверяю подписку…</button>
+          <div id="weather-notification-notice" class="notice" role="status"></div>
         </div>
       </div>
     </section>
@@ -3400,6 +3483,10 @@ function miniAppHtml() {
       var clothingBase = document.getElementById("clothing-base");
       var clothingShoes = document.getElementById("clothing-shoes");
       var clothingExtra = document.getElementById("clothing-extra");
+      var weatherNotificationToggle = document.getElementById("weather-notification-toggle");
+      var weatherNotificationNotice = document.getElementById("weather-notification-notice");
+      var weatherNotification = { city: "", subscribed: false, subscribedCity: null, busy: false };
+      var weatherNotificationRequestId = 0;
       var assistantForm = document.getElementById("assistant-form");
       var assistantQuery = document.getElementById("assistant-query");
       var assistantNotice = document.getElementById("assistant-notice");
@@ -3450,6 +3537,88 @@ function miniAppHtml() {
       function setWeatherNotice(text, isError) {
         weatherNotice.textContent = text || "";
         weatherNotice.className = isError ? "notice error" : "notice";
+      }
+
+      function setWeatherNotificationNotice(text, isError) {
+        weatherNotificationNotice.textContent = text || "";
+        weatherNotificationNotice.className = isError ? "notice error" : "notice";
+      }
+
+      function sameWeatherCity(left, right) {
+        return String(left || "").trim().toLocaleLowerCase("ru") === String(right || "").trim().toLocaleLowerCase("ru");
+      }
+
+      function updateWeatherNotificationToggle() {
+        var city = weatherNotification.city;
+        var subscribedToCurrentCity = weatherNotification.subscribed && sameWeatherCity(weatherNotification.subscribedCity, city);
+        weatherNotificationToggle.disabled = !city || weatherNotification.busy;
+        if (weatherNotification.busy) {
+          weatherNotificationToggle.textContent = "Сохраняю…";
+        } else if (subscribedToCurrentCity) {
+          weatherNotificationToggle.textContent = "🔕 Выключить уведомления";
+        } else {
+          weatherNotificationToggle.textContent = "🔔 Получать погоду каждые 3 часа";
+        }
+      }
+
+      function applyWeatherNotificationSubscription(subscription) {
+        weatherNotification.subscribed = Boolean(subscription && subscription.subscribed);
+        weatherNotification.subscribedCity = weatherNotification.subscribed ? String(subscription.city || "") : null;
+        updateWeatherNotificationToggle();
+      }
+
+      function refreshWeatherNotification(city) {
+        var requestId = weatherNotificationRequestId + 1;
+        weatherNotificationRequestId = requestId;
+        weatherNotification.city = String(city || "").trim();
+        weatherNotification.subscribed = false;
+        weatherNotification.subscribedCity = null;
+        weatherNotification.busy = true;
+        updateWeatherNotificationToggle();
+        setWeatherNotificationNotice("Проверяю подписку…", false);
+        postJson("/api/weather-notifications", { action: "status" }).then(function (data) {
+          if (requestId !== weatherNotificationRequestId) return;
+          applyWeatherNotificationSubscription(data.subscription || {});
+          if (weatherNotification.subscribed && !sameWeatherCity(weatherNotification.subscribedCity, weatherNotification.city)) {
+            setWeatherNotificationNotice("Сейчас уведомления приходят для города: " + weatherNotification.subscribedCity + ". Нажми кнопку, чтобы сменить город.", false);
+          } else {
+            setWeatherNotificationNotice("", false);
+          }
+        }).catch(function () {
+          if (requestId !== weatherNotificationRequestId) return;
+          weatherNotification.subscribed = false;
+          weatherNotification.subscribedCity = null;
+          setWeatherNotificationNotice("Уведомления пока недоступны. Попробуй чуть позже.", true);
+        }).finally(function () {
+          if (requestId !== weatherNotificationRequestId) return;
+          weatherNotification.busy = false;
+          updateWeatherNotificationToggle();
+        });
+      }
+
+      function toggleWeatherNotification() {
+        if (!weatherNotification.city || weatherNotification.busy) return;
+        var requestId = weatherNotificationRequestId + 1;
+        weatherNotificationRequestId = requestId;
+        var unsubscribe = weatherNotification.subscribed && sameWeatherCity(weatherNotification.subscribedCity, weatherNotification.city);
+        weatherNotification.busy = true;
+        updateWeatherNotificationToggle();
+        setWeatherNotificationNotice(unsubscribe ? "Выключаю уведомления…" : "Включаю уведомления…", false);
+        postJson("/api/weather-notifications", {
+          action: unsubscribe ? "unsubscribe" : "subscribe",
+          city: weatherNotification.city
+        }).then(function (data) {
+          if (requestId !== weatherNotificationRequestId) return;
+          applyWeatherNotificationSubscription(data.subscription || {});
+          setWeatherNotificationNotice(unsubscribe ? "Уведомления выключены." : "Готово — бот будет писать раз в 3 часа.", false);
+        }).catch(function () {
+          if (requestId !== weatherNotificationRequestId) return;
+          setWeatherNotificationNotice("Не получилось изменить подписку. Попробуй ещё раз чуть позже.", true);
+        }).finally(function () {
+          if (requestId !== weatherNotificationRequestId) return;
+          weatherNotification.busy = false;
+          updateWeatherNotificationToggle();
+        });
       }
 
       function setAssistantNotice(text, isError) {
@@ -3510,6 +3679,7 @@ function miniAppHtml() {
         clothingCard.hidden = true;
         clothingToggle.setAttribute("aria-expanded", "false");
         weatherResult.hidden = false;
+        refreshWeatherNotification(weather.city);
       }
 
       function departureText(departure) {
@@ -3875,6 +4045,7 @@ function miniAppHtml() {
         clothingCard.hidden = !clothingCard.hidden;
         clothingToggle.setAttribute("aria-expanded", clothingCard.hidden ? "false" : "true");
       });
+      weatherNotificationToggle.addEventListener("click", toggleWeatherNotification);
       tripForm.addEventListener("submit", function (event) {
         event.preventDefault();
         var from = String(tripFrom.value || "").trim();
@@ -3963,6 +4134,128 @@ function miniAppIndex(value, size) {
 function miniAppCityQuery(value) {
   const city = String(value || "").trim();
   return city.length >= 2 && city.length <= 100 && !/[\r\n\u0000]/.test(city) ? city : null;
+}
+
+function miniAppNotificationAction(value) {
+  const action = String(value || "").trim();
+  return ["status", "subscribe", "unsubscribe"].includes(action) ? action : null;
+}
+
+function weatherNotificationsConfigured() {
+  if (WEATHER_NOTIFICATIONS_SHARED_SECRET.length < 32) return false;
+  try {
+    const url = new URL(WEATHER_NOTIFICATIONS_WORKER_URL);
+    return url.protocol === "https:" && Boolean(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+async function syncWeatherNotificationSubscription(action, chatId, city = null) {
+  if (!weatherNotificationsConfigured()) throw new Error("Weather notifications are not configured");
+  const response = await fetchJson(`${WEATHER_NOTIFICATIONS_WORKER_URL}/v1/subscriptions`, {
+    method: "POST",
+    timeoutMs: 12000,
+    maxBytes: 64 * 1024,
+    label: "Weather notification subscription",
+    headers: {
+      "Content-Type": "application/json",
+      "X-SkyPulse-Notification-Secret": WEATHER_NOTIFICATIONS_SHARED_SECRET
+    },
+    body: JSON.stringify({ action, chatId, city })
+  });
+  const subscription = response?.subscription;
+  if (!response?.ok || !subscription || typeof subscription.subscribed !== "boolean") {
+    throw new Error("Weather notification service returned an invalid response");
+  }
+  return {
+    subscribed: subscription.subscribed,
+    city: miniAppCityQuery(subscription.city) || null
+  };
+}
+
+function weatherNotificationSubscriber(value) {
+  const chatId = String(value?.chatId || "");
+  const city = miniAppCityQuery(value?.city);
+  return /^\d{1,20}$/.test(chatId) && city ? { chatId, city } : null;
+}
+
+function formatWeatherNotification(city, weather) {
+  const current = weather.current || {};
+  const currentCode = Number(current.weather_code);
+  const min = miniAppRounded(weather.daily?.temperature_2m_min?.[0]);
+  const max = miniAppRounded(weather.daily?.temperature_2m_max?.[0]);
+  const precipitation = miniAppRounded(weather.daily?.precipitation_probability_max?.[0]);
+  const temperature = miniAppRounded(current.temperature_2m);
+  const apparent = miniAppRounded(current.apparent_temperature);
+  const wind = miniAppRounded(current.wind_speed_10m);
+  const description = escapeHtml(describeWeatherCode(currentCode, "ru"));
+  return [
+    "🔔 <b>Погода каждые 3 часа</b>",
+    `<b>${formatSafeCityName(city)}</b>`,
+    "",
+    `${weatherEmoji(currentCode)} Сейчас: ${temperature == null ? "—" : `${temperature}°C`}, ${description}`,
+    apparent == null ? null : `🌡 Ощущается как: ${apparent}°C`,
+    wind == null ? null : `💨 Ветер: ${wind} км/ч`,
+    min == null || max == null ? null : `Сегодня: ${min}…${max}°C`,
+    precipitation == null ? null : `💧 Вероятность осадков: ${precipitation}%`
+  ].filter(Boolean).join("\n");
+}
+
+function telegramDestinationUnavailable(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return message.includes("blocked by the user") || message.includes("chat not found") || message.includes("user is deactivated");
+}
+
+async function mapWithConcurrency(items, limit, task) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        results[index] = await task(items[index]);
+      } catch (error) {
+        results[index] = { status: "failed", error };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function deliverWeatherNotificationBatch(subscribers) {
+  const cityMessages = new Map();
+  const messageForCity = async (cityQuery) => {
+    const key = cityQuery.toLocaleLowerCase("ru");
+    if (!cityMessages.has(key)) {
+      cityMessages.set(key, (async () => {
+        const city = await findCity(cityQuery, "ru");
+        if (!city) throw new Error("Notification city was not found");
+        const weather = await getWeather(city);
+        return formatWeatherNotification(city, weather);
+      })());
+    }
+    return cityMessages.get(key);
+  };
+
+  const results = await mapWithConcurrency(subscribers, 4, async (subscriber) => {
+    try {
+      const text = await messageForCity(subscriber.city);
+      await sendMessage(subscriber.chatId, text, { disable_web_page_preview: true });
+      return { status: "delivered", chatId: subscriber.chatId };
+    } catch (error) {
+      if (telegramDestinationUnavailable(error)) return { status: "disabled", chatId: subscriber.chatId };
+      console.error("Weather notification delivery failed:", error.message);
+      return { status: "failed", chatId: subscriber.chatId };
+    }
+  });
+
+  return {
+    delivered: results.filter((result) => result?.status === "delivered").map((result) => result.chatId),
+    disabled: results.filter((result) => result?.status === "disabled").map((result) => result.chatId)
+  };
 }
 
 function miniAppRounded(value) {
@@ -4217,6 +4510,50 @@ async function handleMiniAppRequest(req, res, requestUrl) {
     return true;
   }
 
+  if (requestUrl.pathname === "/api/weather-notifications") {
+    if (req.method !== "POST") {
+      miniAppError(res, 405, "Method not allowed");
+      return true;
+    }
+    if (isMiniAppNotificationRateLimited(req, authorization)) {
+      miniAppError(res, 429, "Too many notification requests. Please wait a minute.");
+      return true;
+    }
+    if (!authorization?.userId) {
+      miniAppError(res, 400, "This Mini App launch has no Telegram user");
+      return true;
+    }
+
+    let payload;
+    try {
+      const body = await readRequestBody(req, 8 * 1024);
+      payload = JSON.parse(body);
+    } catch (error) {
+      miniAppError(res, error?.message === "Request body too large" ? 413 : 400, "Invalid request");
+      return true;
+    }
+
+    const action = miniAppNotificationAction(payload?.action);
+    const city = action === "subscribe" ? miniAppCityQuery(payload?.city) : null;
+    if (!action || (action === "subscribe" && !city)) {
+      miniAppError(res, 400, "Invalid weather notification request");
+      return true;
+    }
+    if (!weatherNotificationsConfigured()) {
+      miniAppError(res, 503, "Weather notifications are being set up");
+      return true;
+    }
+
+    try {
+      const subscription = await syncWeatherNotificationSubscription(action, authorization.userId, city);
+      sendJson(res, 200, { ok: true, subscription });
+    } catch (error) {
+      console.error("Weather notification subscription error:", error.message);
+      miniAppError(res, 502, "Weather notification service is unavailable");
+    }
+    return true;
+  }
+
   if (requestUrl.pathname === "/api/psychologist") {
     if (req.method !== "POST") {
       miniAppError(res, 405, "Method not allowed");
@@ -4434,6 +4771,10 @@ function startWebhookServer() {
   const server = http.createServer(async (req, res) => {
     try {
       const requestUrl = new URL(req.url || "/", "http://localhost");
+      if (requestUrl.pathname === WEATHER_NOTIFICATIONS_DELIVERY_PATH) {
+        await handleWeatherNotificationDelivery(req, res);
+        return;
+      }
       if (await handleMiniAppRequest(req, res, requestUrl)) return;
 
       if (req.method === "GET" && (req.url === "/" || req.url === "/healthz")) {
@@ -4548,5 +4889,8 @@ module.exports = {
   nextTwoHourDepartures,
   isPsychologyCrisisMessage,
   miniAppPsychologyMessages,
-  psychologistCrisisAnswer
+  psychologistCrisisAnswer,
+  miniAppNotificationAction,
+  weatherNotificationSubscriber,
+  formatWeatherNotification
 };

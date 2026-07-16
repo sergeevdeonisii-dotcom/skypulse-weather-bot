@@ -10,3 +10,7 @@ services:
         sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
+      - key: WEATHER_NOTIFICATIONS_WORKER_URL
+        sync: false
+      - key: WEATHER_NOTIFICATIONS_SHARED_SECRET
+        sync: false

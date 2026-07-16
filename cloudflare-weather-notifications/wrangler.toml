@@ -1,0 +1,16 @@
+name = "skypulse-weather-notifications"
+main = "src/worker.js"
+compatibility_date = "2026-07-16"
+workers_dev = true
+
+[triggers]
+crons = ["0 */3 * * *"]
+
+[vars]
+RENDER_DELIVERY_URL = "https://skypulse-weather-bot.onrender.com/internal/weather-notifications/deliver"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "skypulse-weather-notifications"
+database_id = "c37f1cee-d13d-4e3c-94af-16e7739e8a09"
+migrations_dir = "migrations"
