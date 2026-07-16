@@ -2710,12 +2710,15 @@ function parseBtransSchedule(html) {
   const stopName = stripTags((html.match(/Название остановки:[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/) || [])[1] || "");
   const direction = stripTags((html.match(/Направление:[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/) || [])[1] || "");
   const rows = [...html.matchAll(/<tr class="schedule-section[\s\S]*?<\/tr>/g)].map((match) => match[0]);
-  const schedule = { weekdays: [], weekend: [] };
+  const schedule = { weekdays: [], weekend: [], hours: [] };
   let currentHour = null;
 
   for (const row of rows) {
     const hourMatch = row.match(/<th[\s\S]*?<time[^>]*>(\d{1,2})<\/time>[\s\S]*?<\/th>/);
-    if (hourMatch) currentHour = hourMatch[1].padStart(2, "0");
+    if (hourMatch) {
+      currentHour = hourMatch[1].padStart(2, "0");
+      if (!schedule.hours.includes(currentHour)) schedule.hours.push(currentHour);
+    }
     if (!currentHour) continue;
 
     const type = row.includes("weekend") || row.includes("Вых.") ? "weekend" : "weekdays";
@@ -2728,6 +2731,40 @@ function parseBtransSchedule(html) {
   }
 
   return { title, stopName, direction, schedule };
+}
+
+function scheduleHourLine(value) {
+  const match = String(value || "").match(/^(\d{1,2})\s*:\s*(.+)$/);
+  if (!match) return null;
+  const hour = match[1].padStart(2, "0");
+  const minutes = match[2].trim();
+  return /^\d{2}$/.test(hour) && minutes ? { hour, minutes } : null;
+}
+
+function miniAppScheduleRows(schedule) {
+  const source = schedule && typeof schedule === "object" ? schedule : {};
+  const byHour = new Map();
+  const order = [];
+  const ensureHour = (value) => {
+    const hour = String(value || "").padStart(2, "0");
+    if (!/^\d{2}$/.test(hour)) return null;
+    if (!byHour.has(hour)) {
+      byHour.set(hour, { hour, weekdays: "", weekend: "" });
+      order.push(hour);
+    }
+    return byHour.get(hour);
+  };
+
+  for (const hour of Array.isArray(source.hours) ? source.hours : []) ensureHour(hour);
+  for (const type of ["weekdays", "weekend"]) {
+    for (const line of Array.isArray(source[type]) ? source[type] : []) {
+      const details = scheduleHourLine(line);
+      if (!details) continue;
+      const row = ensureHour(details.hour);
+      if (row) row[type] = details.minutes;
+    }
+  }
+  return order.map((hour) => byHour.get(hour));
 }
 
 async function getBtransStopSchedule(url) {
@@ -4091,9 +4128,17 @@ function miniAppHtml() {
     .stop { width: 100%; text-align: left; font-weight: 500; }
     .stop span { color: var(--hint); display: inline-block; min-width: 28px; font-variant-numeric: tabular-nums; }
     .back { background: transparent; border: 0; color: var(--accent); padding: 0; min-height: 26px; font-weight: 650; }
-    .schedule-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .schedule-title { margin: 0 0 6px; font-weight: 750; }
-    .schedule-line { padding: 5px 0; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+    .schedule-table { overflow: hidden; margin-top: 12px; border: 1px solid var(--border); border-radius: 13px; font-variant-numeric: tabular-nums; }
+    .schedule-head, .schedule-row { display: grid; grid-template-columns: 52px minmax(0, 1fr) minmax(0, 1fr); }
+    .schedule-head { background: color-mix(in srgb, var(--accent) 10%, var(--card)); color: var(--hint); font-size: 13px; font-weight: 750; }
+    .schedule-head > div, .schedule-hour, .schedule-cell { min-width: 0; padding: 8px 9px; }
+    .schedule-head > div:first-child, .schedule-hour { border-right: 1px solid var(--border); }
+    .schedule-head > div:nth-child(2), .schedule-cell.weekdays { border-right: 1px solid var(--border); }
+    .schedule-hour { display: flex; align-items: center; justify-content: flex-end; color: var(--hint); background: color-mix(in srgb, var(--accent) 6%, var(--card)); font-weight: 750; }
+    .schedule-cell, .schedule-hour { border-top: 1px solid var(--border); }
+    .schedule-cell { overflow-wrap: anywhere; font-weight: 600; }
+    .schedule-cell.empty { color: var(--hint); font-weight: 500; }
+    .schedule-empty { padding: 12px; color: var(--hint); text-align: center; }
     .notice { min-height: 21px; margin-top: 13px; color: var(--hint); font-size: 14px; }
     .notice.error { color: #d84f4f; }
     .weather-search { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin-top: 16px; }
@@ -4136,7 +4181,7 @@ function miniAppHtml() {
     .leaflet-container { font: 14px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     [hidden] { display: none !important; }
     @media (max-width: 430px) { .assistant-form { grid-template-columns: 1fr; } }
-    @media (max-width: 360px) { .route-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } .schedule-grid, .forecast-days, .pro-hourly-list { grid-template-columns: 1fr; } }
+    @media (max-width: 360px) { .route-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } .forecast-days, .pro-hourly-list { grid-template-columns: 1fr; } .schedule-head, .schedule-row { grid-template-columns: 44px minmax(0, 1fr) minmax(0, 1fr); } .schedule-head > div, .schedule-hour, .schedule-cell { padding-inline: 7px; } }
   </style>
 </head>
 <body>
@@ -4244,9 +4289,13 @@ function miniAppHtml() {
       <div class="card">
         <strong id="schedule-title"></strong>
         <p id="schedule-direction" class="muted"></p>
-        <div class="schedule-grid">
-          <div><p class="schedule-title">Будни</p><div id="weekdays"></div></div>
-          <div><p class="schedule-title">Выходные</p><div id="weekend"></div></div>
+        <div class="schedule-table" role="table" aria-label="Расписание по часам">
+          <div class="schedule-head" role="row">
+            <div role="columnheader">Час</div>
+            <div role="columnheader">Будни</div>
+            <div role="columnheader">Выходные</div>
+          </div>
+          <div id="schedule-rows" role="rowgroup"></div>
         </div>
         <p class="muted">* — в гараж</p>
       </div>
@@ -4269,8 +4318,7 @@ function miniAppHtml() {
       var scheduleSection = document.getElementById("schedule-section");
       var scheduleTitle = document.getElementById("schedule-title");
       var scheduleDirection = document.getElementById("schedule-direction");
-      var weekdays = document.getElementById("weekdays");
-      var weekend = document.getElementById("weekend");
+      var scheduleRows = document.getElementById("schedule-rows");
       var weatherTab = document.getElementById("weather-tab");
       var transportTab = document.getElementById("transport-tab");
       var weatherSection = document.getElementById("weather-section");
@@ -4996,13 +5044,55 @@ function miniAppHtml() {
         routeSection.hidden = false;
       }
 
-      function renderScheduleLines(container, lines) {
-        container.replaceChildren();
-        (lines.length ? lines : ["Нет рейсов"]).forEach(function (line) {
-          var item = document.createElement("div");
-          item.className = "schedule-line";
-          item.textContent = line;
-          container.appendChild(item);
+      function scheduleRowsFromLines(weekdays, weekend) {
+        var byHour = {};
+        var order = [];
+        function add(lines, key) {
+          (Array.isArray(lines) ? lines : []).forEach(function (line) {
+            var match = String(line || "").match(/^(\\d{1,2})\\s*:\\s*(.+)$/);
+            if (!match) return;
+            var hour = String(match[1]).padStart(2, "0");
+            if (!byHour[hour]) {
+              byHour[hour] = { hour: hour, weekdays: "", weekend: "" };
+              order.push(hour);
+            }
+            byHour[hour][key] = String(match[2]).trim();
+          });
+        }
+        add(weekdays, "weekdays");
+        add(weekend, "weekend");
+        return order.map(function (hour) { return byHour[hour]; });
+      }
+
+      function renderScheduleRows(rows) {
+        scheduleRows.replaceChildren();
+        if (!Array.isArray(rows) || !rows.length) {
+          var empty = document.createElement("div");
+          empty.className = "schedule-empty";
+          empty.textContent = "Нет рейсов по опубликованному расписанию.";
+          scheduleRows.appendChild(empty);
+          return;
+        }
+        rows.forEach(function (source) {
+          var row = document.createElement("div");
+          row.className = "schedule-row";
+          row.setAttribute("role", "row");
+
+          var hour = document.createElement("div");
+          hour.className = "schedule-hour";
+          hour.setAttribute("role", "cell");
+          hour.textContent = String(source.hour || "").padStart(2, "0") + ":";
+
+          ["weekdays", "weekend"].forEach(function (key) {
+            var cell = document.createElement("div");
+            var value = String(source[key] || "").trim();
+            cell.className = "schedule-cell " + key + (value ? "" : " empty");
+            cell.setAttribute("role", "cell");
+            cell.textContent = value || "—";
+            row.appendChild(cell);
+          });
+          row.insertBefore(hour, row.firstChild);
+          scheduleRows.appendChild(row);
         });
       }
 
@@ -5013,8 +5103,9 @@ function miniAppHtml() {
         request(path).then(function (data) {
           scheduleTitle.textContent = data.schedule.title || data.schedule.stopName || "Расписание";
           scheduleDirection.textContent = data.schedule.direction || "";
-          renderScheduleLines(weekdays, data.schedule.weekdays || []);
-          renderScheduleLines(weekend, data.schedule.weekend || []);
+          renderScheduleRows(Array.isArray(data.schedule.rows)
+            ? data.schedule.rows
+            : scheduleRowsFromLines(data.schedule.weekdays, data.schedule.weekend));
           scheduleSection.hidden = false;
           routeSection.hidden = true;
           setNotice("", false);
@@ -6305,6 +6396,7 @@ async function handleMiniAppRequest(req, res, requestUrl) {
           title: schedule.title,
           stopName: schedule.stopName,
           direction: schedule.direction,
+          rows: miniAppScheduleRows(schedule.schedule),
           weekdays: schedule.schedule.weekdays,
           weekend: schedule.schedule.weekend
         }
@@ -6457,6 +6549,7 @@ if (require.main === module) {
 module.exports = {
   grodnoClock,
   nextTwoHourDepartures,
+  miniAppScheduleRows,
   miniAppNotificationAction,
   miniAppWeatherPayload,
   miniAppProWeatherDetails,

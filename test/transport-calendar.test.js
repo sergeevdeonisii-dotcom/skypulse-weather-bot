@@ -7,7 +7,7 @@ const {
   radunitsaIsoDate,
   serviceDayForDateParts
 } = require("../transport-calendar");
-const { nextTwoHourDepartures } = require("../bot");
+const { nextTwoHourDepartures, miniAppScheduleRows } = require("../bot");
 
 test("calculates Orthodox Easter and Radunitsa for 2026", () => {
   assert.equal(orthodoxEasterIsoDate(2026), "2026-04-12");
@@ -46,4 +46,19 @@ test("smart search returns only the next two hours and uses the holiday timetabl
   const departures = nextTwoHourDepartures(schedule, new Date("2026-07-03T06:50:00Z"));
   assert.deepEqual(departures.map((item) => item.time), ["10:05", "10:35", "11:45"]);
   assert.ok(departures.every((item) => item.minutesUntil <= 120));
+});
+
+test("builds one shared hour rail for weekday and weekend timetable columns", () => {
+  const rows = miniAppScheduleRows({
+    hours: ["05", "06", "07", "00"],
+    weekdays: ["05: 43", "06: 29 52", "07: 10 23 41", "00: 44"],
+    weekend: ["06: 12 45", "07: 13 43", "00: 17"]
+  });
+
+  assert.deepEqual(rows, [
+    { hour: "05", weekdays: "43", weekend: "" },
+    { hour: "06", weekdays: "29 52", weekend: "12 45" },
+    { hour: "07", weekdays: "10 23 41", weekend: "13 43" },
+    { hour: "00", weekdays: "44", weekend: "17" }
+  ]);
 });
