@@ -38,7 +38,7 @@ function cleanPaymentChargeId(value) {
 }
 
 function isComplimentaryProChargeId(value) {
-  return /^complimentary-pro-\d{1,20}-v1$/.test(String(value || ""));
+  return /^complimentary-pro-\d{1,20}(?:-[a-z0-9][a-z0-9_-]{0,63})?-v1$/.test(String(value || ""));
 }
 
 function constantTimeEqual(left, right) {

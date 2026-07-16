@@ -22,3 +22,5 @@ services:
         value: pitrparkeryouoi
       - key: COMPLIMENTARY_PRO_USER_IDS
         sync: false
+      - key: COMPLIMENTARY_PRO_USERNAME_GIFTS
+        sync: false

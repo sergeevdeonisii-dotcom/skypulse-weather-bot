@@ -37,6 +37,14 @@ For a one-time complimentary 30-day Pro period, set
 numeric user IDs. The app sends the recipient a confirmation describing the Pro
 features. Keep real user IDs in platform configuration rather than the repository.
 
+If only a Telegram username is known, configure a pending gift with
+`COMPLIMENTARY_PRO_USERNAME_GIFTS`. Use comma-separated `username:months` pairs,
+for example `skyfriend:6`. Telegram does not disclose a private user's numeric ID to
+a bot by username, so the gift is issued exactly once when that person next starts
+or messages the bot. The recipient then receives the usual Pro confirmation from
+the bot. Usernames are matched case-insensitively without `@`; keep this setting in
+Render rather than the repository.
+
 ## Smart transport search
 
 The Mini App shows departures for the next two hours in Grodno time. It switches to the weekend timetable on Saturdays, Sundays, Belarusian statutory non-working holidays (including Radunitsa), and officially transferred days off.

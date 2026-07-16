@@ -46,6 +46,9 @@ const COMPLIMENTARY_PRO_USER_IDS = [...new Set(
     .map((value) => telegramUserId(value.trim()))
     .filter(Boolean)
 )];
+const COMPLIMENTARY_PRO_USERNAME_GIFTS = parseComplimentaryProUsernameGifts(
+  process.env.COMPLIMENTARY_PRO_USERNAME_GIFTS
+);
 const GRODNO_TIME_ZONE = "Europe/Minsk";
 const BELARUS_WEEKEND_SERVICE_DATES = configuredWeekendServiceDates(process.env.BELARUS_WEEKEND_SERVICE_DATES);
 const MAX_MESSAGE_TEXT_LENGTH = 160;
@@ -190,6 +193,45 @@ function miniAppClientKey(req, authorization = null) {
 function telegramUserId(value) {
   const userId = String(value || "");
   return /^\d{1,20}$/.test(userId) ? userId : null;
+}
+
+function telegramUsername(value) {
+  const username = String(value || "").trim().replace(/^@+/, "").toLowerCase();
+  return /^[a-z][a-z0-9_]{4,31}$/.test(username) ? username : null;
+}
+
+function parseComplimentaryProUsernameGifts(value) {
+  const gifts = new Map();
+  for (const rawGift of String(value || "").split(",")) {
+    const [rawUsername, rawMonths, ...extraParts] = rawGift.trim().split(":");
+    const username = telegramUsername(rawUsername);
+    const months = Number(rawMonths);
+    if (extraParts.length || !username || !Number.isInteger(months) || months < 1 || months > 24) continue;
+    gifts.set(username, months);
+  }
+  return gifts;
+}
+
+function addCalendarMonthsToEpoch(startEpoch, months) {
+  const start = Number(startEpoch);
+  const durationMonths = Number(months);
+  if (!Number.isSafeInteger(start) || start <= 0 || !Number.isInteger(durationMonths) || durationMonths < 1 || durationMonths > 24) {
+    return null;
+  }
+
+  const date = new Date(start * 1000);
+  const targetMonthIndex = date.getUTCMonth() + durationMonths;
+  const targetYear = date.getUTCFullYear() + Math.floor(targetMonthIndex / 12);
+  const targetMonth = targetMonthIndex % 12;
+  const lastDay = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  return Math.floor(Date.UTC(
+    targetYear,
+    targetMonth,
+    Math.min(date.getUTCDate(), lastDay),
+    date.getUTCHours(),
+    date.getUTCMinutes(),
+    date.getUTCSeconds()
+  ) / 1000);
 }
 
 function constantTimeTextEqual(left, right) {
@@ -3223,6 +3265,10 @@ async function poll() {
 }
 
 async function handleUpdate(update) {
+  await grantConfiguredUsernameComplimentaryPro(
+    update?.message?.from || update?.callback_query?.from || update?.pre_checkout_query?.from
+  );
+
   if (update.pre_checkout_query) {
     await handlePreCheckoutQuery(update.pre_checkout_query);
     return;
@@ -4494,8 +4540,47 @@ async function syncProSubscription(action, chatId, extra = {}) {
   };
 }
 
-function complimentaryProChargeId(userId) {
-  return `complimentary-pro-${userId}-v1`;
+function complimentaryProChargeId(userId, grantKey = null) {
+  const recipient = telegramUserId(userId);
+  const key = String(grantKey || "").trim().toLowerCase();
+  if (!recipient) throw new Error("Invalid complimentary Pro recipient");
+  if (!key) return `complimentary-pro-${recipient}-v1`;
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(key)) throw new Error("Invalid complimentary Pro grant key");
+  return `complimentary-pro-${recipient}-${key}-v1`;
+}
+
+async function grantConfiguredUsernameComplimentaryPro(from) {
+  const userId = telegramUserId(from?.id);
+  const username = telegramUsername(from?.username);
+  const months = username ? COMPLIMENTARY_PRO_USERNAME_GIFTS.get(username) : null;
+  if (!userId || !months) return false;
+  if (!proPaymentsConfigured()) {
+    console.error(`Complimentary Pro username gift for @${username} was skipped because SkyPulse Pro is not configured.`);
+    return false;
+  }
+
+  try {
+    const current = await syncProSubscription("status", userId);
+    const startsAt = current.subscription.active && current.subscription.expiresAt
+      ? Math.max(Math.floor(Date.now() / 1000), current.subscription.expiresAt)
+      : Math.floor(Date.now() / 1000);
+    const expiresAt = addCalendarMonthsToEpoch(startsAt, months);
+    if (!expiresAt) throw new Error("Could not calculate complimentary Pro expiry");
+
+    const result = await syncProSubscription("grant", userId, {
+      expiresAt,
+      chargeId: complimentaryProChargeId(userId, `username-${username}`),
+      isFirstRecurring: false
+    });
+    if (result.newPayment) {
+      await sendProWelcomeMessage(userId, result.subscription.expiresAt || expiresAt, { complimentary: true });
+      console.log(`Complimentary ${months}-month SkyPulse Pro granted to @${username}.`);
+      return true;
+    }
+  } catch (error) {
+    console.error(`Could not grant complimentary SkyPulse Pro to @${username}:`, error.message);
+  }
+  return false;
 }
 
 async function grantConfiguredComplimentaryPro() {
@@ -5483,5 +5568,8 @@ module.exports = {
   parseProInvoicePayload,
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
-  proWelcomeText
+  proWelcomeText,
+  parseComplimentaryProUsernameGifts,
+  addCalendarMonthsToEpoch,
+  complimentaryProChargeId
 };

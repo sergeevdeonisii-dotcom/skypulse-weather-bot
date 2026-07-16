@@ -8,6 +8,9 @@ const {
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
   proWelcomeText,
+  parseComplimentaryProUsernameGifts,
+  addCalendarMonthsToEpoch,
+  complimentaryProChargeId,
   miniAppWeatherPayload,
   miniAppProWeatherDetails,
   formatWeatherNotification,
@@ -116,6 +119,20 @@ test("labels a complimentary Pro period without an auto-renewal promise", () => 
   assert.match(text, /подключён бесплатно/);
   assert.match(text, /Stars не списывались/);
   assert.match(text, /Автопродление для подарочной подписки отключено/);
+});
+
+test("queues username gifts safely and calculates their calendar expiry", () => {
+  assert.deepEqual(
+    parseComplimentaryProUsernameGifts("@SkyFriend:6,invalid:0,too:many:parts"),
+    new Map([["skyfriend", 6]])
+  );
+  const januaryThirtyFirst = Math.floor(Date.UTC(2027, 0, 31, 12, 15, 0) / 1000);
+  assert.equal(
+    addCalendarMonthsToEpoch(januaryThirtyFirst, 1),
+    Math.floor(Date.UTC(2027, 1, 28, 12, 15, 0) / 1000)
+  );
+  assert.equal(complimentaryProChargeId("123456", "username-skyfriend"), "complimentary-pro-123456-username-skyfriend-v1");
+  assert.equal(addCalendarMonthsToEpoch(januaryThirtyFirst, 0), null);
 });
 
 test("marks Pro notification recipients and adds their extra weather guidance", () => {
