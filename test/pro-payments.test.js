@@ -13,6 +13,7 @@ const {
   complimentaryProChargeId,
   miniAppWeatherPayload,
   miniAppProWeatherDetails,
+  metNoForecastPayload,
   formatWeatherNotification,
   weatherNotificationSubscriber
 } = require("../bot");
@@ -112,6 +113,30 @@ test("keeps outfit advice and the 24-hour plan out of the Free weather payload",
   assert.equal(pro.hours.length, 24);
   assert.equal(pro.hours[0].time, "09:00");
   assert.match(pro.comfortWindow, /Лучшее окно/);
+});
+
+test("converts MET Norway hourly data into the shared weather forecast shape", () => {
+  const city = { name: "Grodno", latitude: 53.6694, longitude: 23.8131, timezone: "Europe/Minsk" };
+  const timeseries = Array.from({ length: 48 }, (_, index) => ({
+    time: new Date(Date.UTC(2027, 0, 1, 21 + index, 0, 0)).toISOString(),
+    data: {
+      instant: { details: { air_temperature: 4 + (index % 4), wind_speed: 9 } },
+      next_1_hours: {
+        summary: { symbol_code: index === 5 ? "heavyrain" : "clearsky_day" },
+        details: { precipitation_amount: index === 5 ? 3.2 : 0 }
+      }
+    }
+  }));
+
+  const weather = metNoForecastPayload(city, { properties: { timeseries } });
+
+  assert.equal(weather.source, "met.no");
+  assert.equal(weather.current.time, "2027-01-02T00:00");
+  assert.equal(weather.hourly.time.length, 48);
+  assert.equal(weather.hourly.weather_code[5], 65);
+  assert.equal(weather.hourly.precipitation_probability[5], 90);
+  assert.deepEqual(weather.daily.time, ["2027-01-02", "2027-01-03"]);
+  assert.equal(weather.daily.precipitation_probability_max[0], 90);
 });
 
 test("labels a complimentary Pro period without an auto-renewal promise", () => {

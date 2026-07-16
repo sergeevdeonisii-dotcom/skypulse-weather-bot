@@ -76,9 +76,12 @@ const MINI_APP_INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60;
 const NOMINATIM_MIN_INTERVAL_MS = 1100;
 const NOMINATIM_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
 const OSM_NETWORK_CACHE_MS = 12 * 60 * 60 * 1000;
+const WEATHER_CACHE_MS = 5 * 60 * 1000;
+const WEATHER_STALE_CACHE_MS = 60 * 60 * 1000;
 const OSM_OVERPASS_URL = process.env.OSM_OVERPASS_URL || "https://maps.mail.ru/osm/tools/overpass/api/interpreter";
 const OSM_NOMINATIM_URL = process.env.OSM_NOMINATIM_URL || "https://nominatim.openstreetmap.org/search";
 const OSM_USER_AGENT = "SkyPulseWeatherBot/1.0 (https://t.me/SkyPulseWeatherBot)";
+const MET_NO_LOCATION_FORECAST_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact";
 const PREFERENCES_FILE = process.env.PREFERENCES_FILE || path.join(__dirname, "data", "user-preferences.json");
 
 const userSessions = new Map();
@@ -90,6 +93,8 @@ const miniAppAiRateBuckets = new Map();
 const miniAppNotificationRateBuckets = new Map();
 const miniAppTripRateBuckets = new Map();
 const userPreferences = new Map();
+const weatherCache = new Map();
+const weatherRequests = new Map();
 const transportCache = {
   routes: { value: null, expiresAt: 0 },
   stops: { value: null, expiresAt: 0 },
@@ -425,6 +430,10 @@ function cleanupRuntimeState(now = Date.now()) {
     if (!cached?.expiresAt || cached.expiresAt < now) {
       lastClothingAdvice.delete(chatId);
     }
+  }
+
+  for (const [key, cached] of weatherCache.entries()) {
+    if (!cached?.staleAt || cached.staleAt < now) weatherCache.delete(key);
   }
 
   for (const [key, cached] of transportCache.routePages.entries()) {
@@ -1203,6 +1212,11 @@ const WEATHER_REQUEST_HEADERS = Object.freeze({
   "Accept": "application/json"
 });
 
+const MET_NO_REQUEST_HEADERS = Object.freeze({
+  "User-Agent": "SkyPulseWeatherBot/1.0 (https://t.me/SkyPulseWeatherBot)",
+  "Accept": "application/json"
+});
+
 function wttrWeatherCode(value) {
   const code = Number(value);
   if (code === 113) return 0;
@@ -1235,6 +1249,157 @@ function wttrSlotForHour(slots, wantedHour) {
 function finiteNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function metNoWeatherCode(value) {
+  const symbol = String(value || "").toLowerCase();
+  if (symbol.includes("thunder")) return 95;
+  if (symbol.includes("snow")) return symbol.includes("heavy") ? 75 : 71;
+  if (symbol.includes("sleet")) return 56;
+  if (symbol.includes("rain")) return symbol.includes("heavy") ? 65 : 51;
+  if (symbol.includes("fog")) return 45;
+  if (symbol.includes("partlycloudy")) return 2;
+  if (symbol.includes("cloudy")) return 3;
+  if (symbol.includes("fair")) return 1;
+  if (symbol.includes("clearsky")) return 0;
+  return 3;
+}
+
+function metNoPrecipitationProbability(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  if (amount < 0.1) return 20;
+  if (amount < 0.5) return 45;
+  if (amount < 2) return 70;
+  return 90;
+}
+
+function weatherLocalDateTime(value, timezone) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone || "UTC",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    if (!values.year || !values.month || !values.day || !values.hour || !values.minute) return null;
+    return {
+      date: `${values.year}-${values.month}-${values.day}`,
+      time: `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}`,
+      hour: Number(values.hour)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function metNoDailyRepresentative(slots) {
+  return slots.reduce((closest, slot) => (
+    !closest || Math.abs(slot.hour - 12) < Math.abs(closest.hour - 12) ? slot : closest
+  ), null);
+}
+
+function metNoForecastPayload(city, data) {
+  const timezone = city?.timezone || "UTC";
+  const entries = Array.isArray(data?.properties?.timeseries) ? data.properties.timeseries : [];
+  const hourlySlots = [];
+  const dailySlots = new Map();
+
+  for (const entry of entries) {
+    const local = weatherLocalDateTime(entry?.time, timezone);
+    const instant = entry?.data?.instant?.details;
+    const temperature = Number(instant?.air_temperature);
+    if (!local || !Number.isFinite(temperature)) continue;
+
+    const period = entry.data.next_1_hours || entry.data.next_6_hours || entry.data.next_12_hours || {};
+    const slot = {
+      time: local.time,
+      hour: local.hour,
+      temperature,
+      apparent: temperature,
+      precipitation: metNoPrecipitationProbability(period?.details?.precipitation_amount),
+      weatherCode: metNoWeatherCode(period?.summary?.symbol_code),
+      wind: finiteNumber(instant?.wind_speed)
+    };
+    hourlySlots.push(slot);
+    if (!dailySlots.has(local.date)) dailySlots.set(local.date, []);
+    dailySlots.get(local.date).push(slot);
+  }
+
+  const days = [...dailySlots.keys()].slice(0, 2);
+  if (hourlySlots.length < 2 || days.length < 2) {
+    throw new Error("MET Norway weather response is incomplete");
+  }
+
+  const daily = {
+    time: [],
+    temperature_2m_max: [],
+    temperature_2m_min: [],
+    precipitation_probability_max: [],
+    weather_code: []
+  };
+  for (const day of days) {
+    const slots = dailySlots.get(day) || [];
+    const representative = metNoDailyRepresentative(slots);
+    daily.time.push(day);
+    daily.temperature_2m_max.push(Math.max(...slots.map((slot) => slot.temperature)));
+    daily.temperature_2m_min.push(Math.min(...slots.map((slot) => slot.temperature)));
+    daily.precipitation_probability_max.push(Math.max(...slots.map((slot) => slot.precipitation)));
+    daily.weather_code.push(representative?.weatherCode ?? 3);
+  }
+
+  const current = hourlySlots[0];
+  return {
+    source: "met.no",
+    timezone,
+    current: {
+      time: current.time,
+      temperature_2m: current.temperature,
+      apparent_temperature: current.apparent,
+      weather_code: current.weatherCode,
+      wind_speed_10m: current.wind
+    },
+    hourly: {
+      time: hourlySlots.map((slot) => slot.time),
+      temperature_2m: hourlySlots.map((slot) => slot.temperature),
+      apparent_temperature: hourlySlots.map((slot) => slot.apparent),
+      precipitation_probability: hourlySlots.map((slot) => slot.precipitation),
+      weather_code: hourlySlots.map((slot) => slot.weatherCode),
+      wind_speed_10m: hourlySlots.map((slot) => slot.wind)
+    },
+    daily
+  };
+}
+
+async function getMetNoForecast(city) {
+  const latitude = Number(city?.latitude);
+  const longitude = Number(city?.longitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    throw new Error("MET Norway forecast needs valid coordinates");
+  }
+  const url = new URL(MET_NO_LOCATION_FORECAST_URL);
+  url.searchParams.set("lat", latitude.toFixed(4));
+  url.searchParams.set("lon", longitude.toFixed(4));
+  const data = await fetchJson(url, {
+    timeoutMs: 9000,
+    maxBytes: 2 * 1024 * 1024,
+    headers: MET_NO_REQUEST_HEADERS,
+    label: "MET Norway weather"
+  });
+  return metNoForecastPayload(city, data);
+}
+
+function weatherCacheKey(city) {
+  const latitude = Number(city?.latitude);
+  const longitude = Number(city?.longitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  return `${latitude.toFixed(3)},${longitude.toFixed(3)}`;
 }
 
 async function getWttrForecast(city) {
@@ -1289,6 +1454,7 @@ async function getWttrForecast(city) {
   }
 
   return {
+    source: "wttr.in",
     timezone: city.timezone || "UTC",
     current: {
       temperature_2m: finiteNumber(observed.temp_C),
@@ -1301,7 +1467,7 @@ async function getWttrForecast(city) {
   };
 }
 
-async function getWeather(city) {
+async function getWeatherFromProviders(city) {
   const url = new URL("https://api.open-meteo.com/v1/forecast");
   url.searchParams.set("latitude", city.latitude);
   url.searchParams.set("longitude", city.longitude);
@@ -1321,10 +1487,56 @@ async function getWeather(city) {
     if (!data || !data.current || !data.hourly || !data.daily) {
       throw new Error("Weather response is incomplete");
     }
-    return data;
+    return { ...data, source: "open-meteo" };
   } catch (primaryError) {
-    console.warn("Open-Meteo failed, using weather fallback:", primaryError.message);
-    return getWttrForecast(city);
+    console.warn("Open-Meteo failed, using MET Norway fallback:", primaryError.message);
+    try {
+      return await getMetNoForecast(city);
+    } catch (metNoError) {
+      console.warn("MET Norway failed, using wttr.in fallback:", metNoError.message);
+      return getWttrForecast(city);
+    }
+  }
+}
+
+async function getWeather(city) {
+  const key = weatherCacheKey(city);
+  if (!key) return getWeatherFromProviders(city);
+
+  const now = Date.now();
+  const cached = weatherCache.get(key);
+  if (cached?.expiresAt > now) return cached.value;
+
+  const pending = weatherRequests.get(key);
+  if (pending) return pending;
+
+  const request = getWeatherFromProviders(city)
+    .then((weather) => {
+      weatherCache.set(key, {
+        value: weather,
+        expiresAt: Date.now() + WEATHER_CACHE_MS,
+        staleAt: Date.now() + WEATHER_STALE_CACHE_MS
+      });
+      return weather;
+    })
+    .catch((error) => {
+      if (cached?.staleAt > Date.now()) {
+        console.warn("Weather providers failed, using a cached forecast:", error.message);
+        return cached.value;
+      }
+      throw error;
+    })
+    .finally(() => weatherRequests.delete(key));
+  weatherRequests.set(key, request);
+  return request;
+}
+
+async function miniAppObservedCurrent(city, weather) {
+  if (weather?.source === "met.no" || weather?.source === "wttr.in") return null;
+  try {
+    return await getObservedCurrent(city);
+  } catch {
+    return null;
   }
 }
 
@@ -4561,7 +4773,9 @@ async function grantConfiguredUsernameComplimentaryPro(from) {
   }
 
   try {
+    const chargeId = complimentaryProChargeId(userId, `username-${username}`);
     const current = await syncProSubscription("status", userId);
+    if (current.subscription.active && current.subscription.chargeId === chargeId) return false;
     const startsAt = current.subscription.active && current.subscription.expiresAt
       ? Math.max(Math.floor(Date.now() / 1000), current.subscription.expiresAt)
       : Math.floor(Date.now() / 1000);
@@ -4570,7 +4784,7 @@ async function grantConfiguredUsernameComplimentaryPro(from) {
 
     const result = await syncProSubscription("grant", userId, {
       expiresAt,
-      chargeId: complimentaryProChargeId(userId, `username-${username}`),
+      chargeId,
       isFirstRecurring: false
     });
     if (result.newPayment) {
@@ -4907,7 +5121,7 @@ async function getMiniAppWeather(cityQuery) {
   if (!city) return null;
 
   const weather = await getWeather(city);
-  const observedCurrent = await getObservedCurrent(city).catch(() => null);
+  const observedCurrent = await miniAppObservedCurrent(city, weather);
   return miniAppWeatherPayload(city, weather, observedCurrent);
 }
 
@@ -4916,7 +5130,7 @@ async function getMiniAppProWeatherDetails(cityQuery) {
   if (!city) return null;
 
   const weather = await getWeather(city);
-  const observedCurrent = await getObservedCurrent(city).catch(() => null);
+  const observedCurrent = await miniAppObservedCurrent(city, weather);
   return miniAppProWeatherDetails(city, weather, observedCurrent);
 }
 
@@ -5563,6 +5777,7 @@ module.exports = {
   miniAppNotificationAction,
   miniAppWeatherPayload,
   miniAppProWeatherDetails,
+  metNoForecastPayload,
   weatherNotificationSubscriber,
   formatWeatherNotification,
   createProInvoicePayload,
