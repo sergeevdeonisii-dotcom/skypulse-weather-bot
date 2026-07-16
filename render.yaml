@@ -15,8 +15,8 @@ services:
       - key: WEATHER_NOTIFICATIONS_SHARED_SECRET
         sync: false
       - key: PRO_MONTHLY_PRICE_STARS
-        value: 49
+        value: 10
       - key: PRO_PAYMENTS_ENABLED
         value: true
       - key: PAYMENT_SUPPORT_USERNAME
-        sync: false
+        value: pitrparkeryouoi

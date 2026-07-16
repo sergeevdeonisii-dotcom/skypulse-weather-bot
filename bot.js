@@ -34,12 +34,12 @@ const WEATHER_NOTIFICATIONS_WORKER_URL = String(process.env.WEATHER_NOTIFICATION
 const WEATHER_NOTIFICATIONS_SHARED_SECRET = String(process.env.WEATHER_NOTIFICATIONS_SHARED_SECRET || "").trim();
 const WEATHER_NOTIFICATIONS_DELIVERY_PATH = "/internal/weather-notifications/deliver";
 const PRO_PRODUCT_CODE = "skypulse-pro-monthly-v1";
-const PRO_MONTHLY_PRICE_STARS = boundedIntegerEnv("PRO_MONTHLY_PRICE_STARS", 49, 1, 10000);
+const PRO_MONTHLY_PRICE_STARS = boundedIntegerEnv("PRO_MONTHLY_PRICE_STARS", 10, 1, 10000);
 const PRO_SUBSCRIPTION_PERIOD_SECONDS = 30 * 24 * 60 * 60;
 const PRO_INVOICE_TTL_SECONDS = 20 * 60;
 const PRO_PAYMENTS_ENABLED = process.env.PRO_PAYMENTS_ENABLED !== "false";
 const PRO_PAYMENT_SIGNING_SECRET = String(process.env.PRO_PAYMENT_SIGNING_SECRET || BOT_TOKEN || "");
-const PAYMENT_SUPPORT_USERNAME = String(process.env.PAYMENT_SUPPORT_USERNAME || "").trim().replace(/^@+/, "");
+const PAYMENT_SUPPORT_USERNAME = String(process.env.PAYMENT_SUPPORT_USERNAME || "pitrparkeryouoi").trim().replace(/^@+/, "");
 const GRODNO_TIME_ZONE = "Europe/Minsk";
 const BELARUS_WEEKEND_SERVICE_DATES = configuredWeekendServiceDates(process.env.BELARUS_WEEKEND_SERVICE_DATES);
 const MAX_MESSAGE_TEXT_LENGTH = 160;

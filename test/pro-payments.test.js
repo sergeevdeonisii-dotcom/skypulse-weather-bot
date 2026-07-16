@@ -26,10 +26,10 @@ test("creates a short-lived Pro invoice payload bound to one Telegram user", () 
 test("rejects a Pro checkout when the payer or Stars amount does not match", () => {
   const payload = createProInvoicePayload("123456", NOW, TEST_SECRET);
 
-  assert.ok(proCheckoutDetails(payload, "123456", "XTR", 49, NOW, TEST_SECRET));
-  assert.equal(proCheckoutDetails(payload, "999999", "XTR", 49, NOW, TEST_SECRET), null);
-  assert.equal(proCheckoutDetails(payload, "123456", "XTR", 48, NOW, TEST_SECRET), null);
-  assert.equal(proCheckoutDetails(payload, "123456", "USD", 49, NOW, TEST_SECRET), null);
+  assert.ok(proCheckoutDetails(payload, "123456", "XTR", 10, NOW, TEST_SECRET));
+  assert.equal(proCheckoutDetails(payload, "999999", "XTR", 10, NOW, TEST_SECRET), null);
+  assert.equal(proCheckoutDetails(payload, "123456", "XTR", 9, NOW, TEST_SECRET), null);
+  assert.equal(proCheckoutDetails(payload, "123456", "USD", 10, NOW, TEST_SECRET), null);
 });
 
 test("accepts only a valid recurring Pro payment with a Telegram payment charge", () => {
@@ -37,7 +37,7 @@ test("accepts only a valid recurring Pro payment with a Telegram payment charge"
   const details = proSuccessfulPaymentDetails({
     invoice_payload: payload,
     currency: "XTR",
-    total_amount: 49,
+    total_amount: 10,
     subscription_expiration_date: NOW + 30 * 24 * 60 * 60,
     telegram_payment_charge_id: "telegram-charge-1",
     is_first_recurring: true
@@ -52,7 +52,7 @@ test("accepts only a valid recurring Pro payment with a Telegram payment charge"
   assert.equal(proSuccessfulPaymentDetails({
     invoice_payload: payload,
     currency: "XTR",
-    total_amount: 49,
+    total_amount: 10,
     subscription_expiration_date: NOW + 30 * 24 * 60 * 60
   }, "123456", NOW, TEST_SECRET), null);
 });

@@ -29,7 +29,7 @@ environment variable. Keep that value in platform secrets only; never commit it.
 The Weather tab includes a monthly **SkyPulse Pro** subscription. It is billed in
 Telegram Stars and unlocks richer weather updates: an outfit suggestion plus an
 important rain, wind, or thunderstorm warning when appropriate. The price defaults
-to 49 Stars per 30 days and can be changed with `PRO_MONTHLY_PRICE_STARS`.
+to 10 Stars per 30 days and can be changed with `PRO_MONTHLY_PRICE_STARS`.
 
 Invoices are created server-side and bound to the Telegram user who opened the Mini
 App. The bot validates every pre-checkout request, then persists the paid access in
