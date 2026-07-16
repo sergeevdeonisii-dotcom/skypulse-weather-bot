@@ -7,6 +7,11 @@ const {
   parseProInvoicePayload,
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
+  authorSupportAmount,
+  createAuthorSupportInvoicePayload,
+  parseAuthorSupportInvoicePayload,
+  authorSupportCheckoutDetails,
+  authorSupportSuccessfulPaymentDetails,
   proInfoText,
   proWelcomeText,
   parseComplimentaryProUsernameGifts,
@@ -65,6 +70,40 @@ test("accepts only a valid recurring Pro payment with a Telegram payment charge"
     total_amount: 10,
     subscription_expiration_date: NOW + 30 * 24 * 60 * 60
   }, "123456", NOW, TEST_SECRET), null);
+});
+
+test("creates a short-lived author support invoice with a bounded Stars amount", () => {
+  const payload = createAuthorSupportInvoicePayload("123456", 37, NOW, TEST_SECRET);
+  const invoice = parseAuthorSupportInvoicePayload(payload, NOW, TEST_SECRET);
+
+  assert.deepEqual(invoice, { userId: "123456", amount: 37, expiresAt: NOW + 20 * 60 });
+  assert.equal(authorSupportAmount("1"), 1);
+  assert.equal(authorSupportAmount("100"), 100);
+  assert.equal(authorSupportAmount("0"), null);
+  assert.equal(authorSupportAmount("101"), null);
+  assert.equal(authorSupportAmount("1.5"), null);
+  assert.equal(parseAuthorSupportInvoicePayload(payload, NOW + 20 * 60, TEST_SECRET), null);
+});
+
+test("accepts only the signed amount for a one-time author support payment", () => {
+  const payload = createAuthorSupportInvoicePayload("123456", 25, NOW, TEST_SECRET);
+
+  assert.ok(authorSupportCheckoutDetails(payload, "123456", "XTR", 25, NOW, TEST_SECRET));
+  assert.equal(authorSupportCheckoutDetails(payload, "999999", "XTR", 25, NOW, TEST_SECRET), null);
+  assert.equal(authorSupportCheckoutDetails(payload, "123456", "XTR", 24, NOW, TEST_SECRET), null);
+
+  const details = authorSupportSuccessfulPaymentDetails({
+    invoice_payload: payload,
+    currency: "XTR",
+    total_amount: 25,
+    telegram_payment_charge_id: "support-charge-1"
+  }, "123456", NOW, TEST_SECRET);
+  assert.deepEqual(details, {
+    userId: "123456",
+    amount: 25,
+    expiresAt: NOW + 20 * 60,
+    chargeId: "support-charge-1"
+  });
 });
 
 test("confirms a Pro purchase with the enabled notification features", () => {

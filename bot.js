@@ -34,9 +34,12 @@ const WEATHER_NOTIFICATIONS_WORKER_URL = String(process.env.WEATHER_NOTIFICATION
 const WEATHER_NOTIFICATIONS_SHARED_SECRET = String(process.env.WEATHER_NOTIFICATIONS_SHARED_SECRET || "").trim();
 const WEATHER_NOTIFICATIONS_DELIVERY_PATH = "/internal/weather-notifications/deliver";
 const PRO_PRODUCT_CODE = "skypulse-pro-monthly-v1";
+const AUTHOR_SUPPORT_PRODUCT_CODE = "skypulse-author-support-v1";
 const PRO_MONTHLY_PRICE_STARS = boundedIntegerEnv("PRO_MONTHLY_PRICE_STARS", 10, 1, 10000);
 const PRO_SUBSCRIPTION_PERIOD_SECONDS = 30 * 24 * 60 * 60;
 const PRO_INVOICE_TTL_SECONDS = 20 * 60;
+const AUTHOR_SUPPORT_MIN_STARS = 1;
+const AUTHOR_SUPPORT_MAX_STARS = 100;
 const PRO_PAYMENTS_ENABLED = process.env.PRO_PAYMENTS_ENABLED !== "false";
 const PRO_PAYMENT_SIGNING_SECRET = String(process.env.PRO_PAYMENT_SIGNING_SECRET || BOT_TOKEN || "");
 const PAYMENT_SUPPORT_USERNAME = String(process.env.PAYMENT_SUPPORT_USERNAME || "pitrparkeryouoi").trim().replace(/^@+/, "");
@@ -319,6 +322,72 @@ function proSuccessfulPaymentDetails(payment, payerId, nowSeconds = Math.floor(D
     chargeId,
     isFirstRecurring: payment?.is_first_recurring === true
   };
+}
+
+function authorSupportAmount(value) {
+  const rawAmount = String(value ?? "").trim();
+  if (!/^[1-9]\d{0,2}$/.test(rawAmount)) return null;
+  const amount = Number(rawAmount);
+  return Number.isSafeInteger(amount) && amount >= AUTHOR_SUPPORT_MIN_STARS && amount <= AUTHOR_SUPPORT_MAX_STARS
+    ? amount
+    : null;
+}
+
+function createAuthorSupportInvoicePayload(userId, amount, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const supporter = telegramUserId(userId);
+  const stars = authorSupportAmount(amount);
+  const issuedAt = Number(nowSeconds);
+  if (!supporter || !stars || !Number.isInteger(issuedAt) || !signingSecret) {
+    throw new Error("Could not create an author support invoice payload");
+  }
+  const expiresAt = issuedAt + PRO_INVOICE_TTL_SECONDS;
+  const nonce = crypto.randomBytes(12).toString("base64url");
+  const base = `${AUTHOR_SUPPORT_PRODUCT_CODE}.${supporter}.${stars}.${expiresAt}.${nonce}`;
+  return `${base}.${proInvoiceSignature(base, signingSecret)}`;
+}
+
+function parseAuthorSupportInvoicePayload(value, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const payload = String(value || "");
+  const now = Number(nowSeconds);
+  if (!Number.isInteger(now) || !signingSecret || payload.length > 128) return null;
+
+  const parts = payload.split(".");
+  if (parts.length !== 6 || parts[0] !== AUTHOR_SUPPORT_PRODUCT_CODE) return null;
+  const [, rawUserId, rawAmount, rawExpiresAt, nonce, signature] = parts;
+  const userId = telegramUserId(rawUserId);
+  const amount = authorSupportAmount(rawAmount);
+  const expiresAt = Number(rawExpiresAt);
+  if (!userId || !amount || !Number.isSafeInteger(expiresAt) || !/^[A-Za-z0-9_-]{16}$/.test(nonce) || !/^[A-Za-z0-9_-]{32}$/.test(signature)) {
+    return null;
+  }
+  if (expiresAt <= now || expiresAt > now + PRO_INVOICE_TTL_SECONDS + 5 * 60) return null;
+
+  const base = `${AUTHOR_SUPPORT_PRODUCT_CODE}.${userId}.${amount}.${expiresAt}.${nonce}`;
+  if (!constantTimeTextEqual(signature, proInvoiceSignature(base, signingSecret))) return null;
+  return { userId, amount, expiresAt };
+}
+
+function authorSupportCheckoutDetails(value, payerId, currency, totalAmount, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const invoice = parseAuthorSupportInvoicePayload(value, nowSeconds, signingSecret);
+  const payer = telegramUserId(payerId);
+  if (!invoice || !payer || invoice.userId !== payer || currency !== "XTR" || Number(totalAmount) !== invoice.amount) {
+    return null;
+  }
+  return invoice;
+}
+
+function authorSupportSuccessfulPaymentDetails(payment, payerId, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const invoice = authorSupportCheckoutDetails(
+    payment?.invoice_payload,
+    payerId,
+    payment?.currency,
+    payment?.total_amount,
+    nowSeconds,
+    signingSecret
+  );
+  const chargeId = proPaymentChargeId(payment?.telegram_payment_charge_id);
+  if (!invoice || !chargeId) return null;
+  return { ...invoice, chargeId };
 }
 
 function isMiniAppApiRateLimited(req, authorization) {
@@ -702,6 +771,7 @@ function menuKeyboard(lang) {
         { text: LABELS[lang].language, callback_data: "choose_lang" }
       ],
       [{ text: lang === "en" ? "✨ SkyPulse Pro" : "✨ SkyPulse Pro", callback_data: "pro" }],
+      [{ text: lang === "en" ? "💛 Support the author" : "💛 Поддержать автора", callback_data: "support_author" }],
       [{ text: lang === "en" ? "ℹ️ Information" : "ℹ️ Информация", callback_data: "info_menu" }]
     ]
   };
@@ -865,6 +935,7 @@ function proInfoKeyboard(lang) {
         ? { text: lang === "en" ? "✨ Open SkyPulse Pro" : "✨ Открыть SkyPulse Pro", web_app: { url } }
         : { text: lang === "en" ? "🚌 Open Mini App" : "🚌 Открыть мини-приложение", callback_data: "transport_menu" }
       ],
+      [{ text: lang === "en" ? "💛 Support the author" : "💛 Поддержать автора", callback_data: "support_author" }],
       [{ text: lang === "en" ? "💳 Payment support" : "💳 Поддержка по оплате", callback_data: "paysupport" }]
     ]
   };
@@ -1099,6 +1170,70 @@ async function sendMessage(chatId, text, extra = {}) {
   });
 }
 
+function authorSupportPromptText(lang) {
+  if (lang === "en") {
+    return [
+      "<b>💛 Support the author</b>",
+      "",
+      `Enter an amount from <b>${AUTHOR_SUPPORT_MIN_STARS}</b> to <b>${AUTHOR_SUPPORT_MAX_STARS}</b> ⭐.`,
+      "For example: <b>10</b>",
+      "",
+      "Telegram will then show its official payment button. This is voluntary support and does not change your Pro plan."
+    ].join("\n");
+  }
+  return [
+    "<b>💛 Поддержать автора</b>",
+    "",
+    `Введи количество от <b>${AUTHOR_SUPPORT_MIN_STARS}</b> до <b>${AUTHOR_SUPPORT_MAX_STARS}</b> ⭐.`,
+    "Например: <b>10</b>",
+    "",
+    "После этого появится официальная кнопка оплаты Telegram. Поддержка добровольная и не меняет подписку Pro."
+  ].join("\n");
+}
+
+function authorSupportThanksText(lang, amount) {
+  if (lang === "en") {
+    return [
+      "<b>💛 Thank you for the support!</b>",
+      `Received: <b>${amount} ⭐</b>.`,
+      "It helps develop SkyPulse. Your Pro plan has not changed."
+    ].join("\n");
+  }
+  return [
+    "<b>💛 Спасибо за поддержку!</b>",
+    `Получено: <b>${amount} ⭐</b>.`,
+    "Это помогает развивать SkyPulse. Подписка Pro не изменилась."
+  ].join("\n");
+}
+
+async function askForAuthorSupport(chatId) {
+  const lang = langOf(chatId);
+  resetToMenu(chatId);
+  userSessions.set(chatId, { step: "author_support_amount", updatedAt: Date.now() });
+  await sendMessage(chatId, authorSupportPromptText(lang), {
+    reply_markup: {
+      inline_keyboard: [[{ text: lang === "en" ? "← Menu" : "← В меню", callback_data: "menu" }]]
+    }
+  });
+}
+
+async function sendAuthorSupportInvoice(chatId, amount, lang = langOf(chatId)) {
+  const stars = authorSupportAmount(amount);
+  if (!stars || !starsPaymentsConfigured()) {
+    throw new Error("Author support payments are not configured");
+  }
+  return telegram("sendInvoice", {
+    chat_id: chatId,
+    title: lang === "en" ? "Support SkyPulse" : "Поддержка SkyPulse",
+    description: lang === "en"
+      ? "Voluntary support for SkyPulse development. Thank you!"
+      : "Добровольная поддержка развития SkyPulse. Спасибо!",
+    payload: createAuthorSupportInvoicePayload(chatId, stars),
+    currency: "XTR",
+    prices: [{ label: lang === "en" ? "Support the author" : "Поддержка автора", amount: stars }]
+  });
+}
+
 function formatProExpiration(expiresAt) {
   try {
     return new Intl.DateTimeFormat("ru-RU", {
@@ -1117,7 +1252,7 @@ function formatProExpiration(expiresAt) {
 async function handlePreCheckoutQuery(preCheckoutQuery) {
   if (!preCheckoutQuery?.id) return;
   const userId = telegramUserId(preCheckoutQuery?.from?.id);
-  const details = userId && proPaymentsConfigured()
+  const proDetails = userId && proPaymentsConfigured()
     ? proCheckoutDetails(
         preCheckoutQuery?.invoice_payload,
         userId,
@@ -1125,11 +1260,19 @@ async function handlePreCheckoutQuery(preCheckoutQuery) {
         preCheckoutQuery?.total_amount
       )
     : null;
-  const accepted = Boolean(details && preCheckoutQuery?.id);
+  const authorSupportDetails = userId && starsPaymentsConfigured()
+    ? authorSupportCheckoutDetails(
+        preCheckoutQuery?.invoice_payload,
+        userId,
+        preCheckoutQuery?.currency,
+        preCheckoutQuery?.total_amount
+      )
+    : null;
+  const accepted = Boolean((proDetails || authorSupportDetails) && preCheckoutQuery?.id);
   await telegram("answerPreCheckoutQuery", {
     pre_checkout_query_id: preCheckoutQuery?.id,
     ok: accepted,
-    ...(accepted ? {} : { error_message: "Счёт устарел или временно недоступен. Открой SkyPulse Pro ещё раз." })
+    ...(accepted ? {} : { error_message: "Счёт устарел или временно недоступен. Попробуй ещё раз." })
   });
 }
 
@@ -1166,40 +1309,55 @@ async function handleSuccessfulPayment(message) {
   const payment = message?.successful_payment;
   if (!payment) return;
 
-  const parsedInvoice = parseProInvoicePayload(payment.invoice_payload);
-  const payerId = telegramUserId(message?.from?.id) || parsedInvoice?.userId || null;
-  const details = payerId ? proSuccessfulPaymentDetails(payment, payerId) : null;
-  if (!details) {
-    console.warn("Ignored an invalid successful payment update.");
+  const parsedProInvoice = parseProInvoicePayload(payment.invoice_payload);
+  const parsedAuthorSupportInvoice = parseAuthorSupportInvoicePayload(payment.invoice_payload);
+  const payerId = telegramUserId(message?.from?.id) || parsedProInvoice?.userId || parsedAuthorSupportInvoice?.userId || null;
+  const proDetails = payerId ? proSuccessfulPaymentDetails(payment, payerId) : null;
+
+  if (proDetails) {
+    if (!proPaymentsConfigured()) {
+      console.error("Received a valid SkyPulse Pro payment while the entitlement service is unavailable.");
+      throw new Error("SkyPulse Pro entitlement service is unavailable");
+    }
+
+    let result;
+    try {
+      result = await syncProSubscription("grant", proDetails.userId, {
+        expiresAt: proDetails.expiresAt,
+        chargeId: proDetails.chargeId,
+        isFirstRecurring: proDetails.isFirstRecurring
+      });
+    } catch (error) {
+      console.error("Could not grant SkyPulse Pro after payment:", error.message);
+      throw error;
+    }
+
+    if (result.newPayment) {
+      try {
+        await sendProWelcomeMessage(proDetails.userId, proDetails.expiresAt, {
+          renewal: !proDetails.isFirstRecurring
+        });
+      } catch (error) {
+        console.error("Could not send SkyPulse Pro confirmation:", error.message);
+      }
+    }
     return;
   }
 
-  if (!proPaymentsConfigured()) {
-    console.error("Received a valid SkyPulse Pro payment while the entitlement service is unavailable.");
-    throw new Error("SkyPulse Pro entitlement service is unavailable");
-  }
-
-  let result;
-  try {
-    result = await syncProSubscription("grant", details.userId, {
-      expiresAt: details.expiresAt,
-      chargeId: details.chargeId,
-      isFirstRecurring: details.isFirstRecurring
-    });
-  } catch (error) {
-    console.error("Could not grant SkyPulse Pro after payment:", error.message);
-    throw error;
-  }
-
-  if (result.newPayment) {
+  const authorSupportDetails = payerId ? authorSupportSuccessfulPaymentDetails(payment, payerId) : null;
+  if (authorSupportDetails) {
+    const lang = langOf(payerId);
     try {
-      await sendProWelcomeMessage(details.userId, details.expiresAt, {
-        renewal: !details.isFirstRecurring
+      await sendMessage(payerId, authorSupportThanksText(lang, authorSupportDetails.amount), {
+        reply_markup: menuKeyboard(lang)
       });
     } catch (error) {
-      console.error("Could not send SkyPulse Pro confirmation:", error.message);
+      console.error("Could not send author support confirmation:", error.message);
     }
+    return;
   }
+
+  console.warn("Ignored an invalid successful payment update.");
 }
 
 async function removeReplyKeyboard(chatId) {
@@ -3061,6 +3219,29 @@ async function handleSession(chatId, text, session) {
   const lang = langOf(chatId);
   session.updatedAt = Date.now();
 
+  if (session.step === "author_support_amount") {
+    const amount = authorSupportAmount(text);
+    if (!amount) {
+      await sendMessage(chatId, lang === "en"
+        ? `Enter a whole number from ${AUTHOR_SUPPORT_MIN_STARS} to ${AUTHOR_SUPPORT_MAX_STARS} Stars.`
+        : `Введи целое число от ${AUTHOR_SUPPORT_MIN_STARS} до ${AUTHOR_SUPPORT_MAX_STARS} Stars.`);
+      return;
+    }
+
+    resetToMenu(chatId);
+    try {
+      await sendAuthorSupportInvoice(chatId, amount, lang);
+    } catch (error) {
+      console.error("Could not create author support invoice:", error.message);
+      await sendMessage(chatId, lang === "en"
+        ? "Could not create the support invoice right now. Try again later."
+        : "Не удалось создать счёт для поддержки. Попробуй ещё раз чуть позже.", {
+        reply_markup: menuKeyboard(lang)
+      });
+    }
+    return;
+  }
+
   if (session.step === "saved_city") {
     let city;
     try {
@@ -3187,6 +3368,11 @@ async function handleCallbackQuery(callbackQuery) {
 
   if (data === "pro") {
     await sendMessage(chatId, proInfoText(lang), { reply_markup: proInfoKeyboard(lang) });
+    return;
+  }
+
+  if (data === "support_author") {
+    await askForAuthorSupport(chatId);
     return;
   }
 
@@ -4821,8 +5007,12 @@ function weatherNotificationsConfigured() {
   }
 }
 
+function starsPaymentsConfigured() {
+  return PRO_PAYMENTS_ENABLED && Boolean(BOT_TOKEN) && Boolean(PRO_PAYMENT_SIGNING_SECRET);
+}
+
 function proPaymentsConfigured() {
-  return PRO_PAYMENTS_ENABLED && Boolean(BOT_TOKEN) && Boolean(PRO_PAYMENT_SIGNING_SECRET) && weatherNotificationsConfigured();
+  return starsPaymentsConfigured() && weatherNotificationsConfigured();
 }
 
 function proSubscriptionFromWorker(value) {
@@ -5952,6 +6142,11 @@ module.exports = {
   parseProInvoicePayload,
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
+  authorSupportAmount,
+  createAuthorSupportInvoicePayload,
+  parseAuthorSupportInvoicePayload,
+  authorSupportCheckoutDetails,
+  authorSupportSuccessfulPaymentDetails,
   proInfoText,
   proWelcomeText,
   parseComplimentaryProUsernameGifts,
