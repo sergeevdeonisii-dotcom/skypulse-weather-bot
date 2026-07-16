@@ -1,4 +1,5 @@
 const MAX_RECIPIENTS_PER_RUN = 30;
+const MAX_PRO_EXPIRY_SECONDS = 400 * 24 * 60 * 60;
 const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",
@@ -17,6 +18,23 @@ function cleanChatId(value) {
 function cleanCity(value) {
   const city = String(value || "").trim().replace(/\s+/g, " ");
   return city.length >= 2 && city.length <= 100 && !/[\r\n\u0000]/.test(city) ? city : null;
+}
+
+function epochSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function cleanProExpiry(value) {
+  const expiresAt = Number(value);
+  const now = epochSeconds();
+  return Number.isSafeInteger(expiresAt) && expiresAt > now && expiresAt <= now + MAX_PRO_EXPIRY_SECONDS
+    ? expiresAt
+    : null;
+}
+
+function cleanPaymentChargeId(value) {
+  const chargeId = String(value || "").trim();
+  return chargeId.length >= 1 && chargeId.length <= 256 && !/[\r\n\u0000]/.test(chargeId) ? chargeId : null;
 }
 
 function constantTimeEqual(left, right) {
@@ -96,6 +114,100 @@ async function updateSubscription(request, env) {
   return json({ ok: true, subscription: { subscribed: false, city: null } });
 }
 
+function proSubscriptionFromRow(row) {
+  const expiresAt = Number(row?.expiresAt);
+  const active = Number.isSafeInteger(expiresAt) && expiresAt > epochSeconds();
+  return {
+    active,
+    expiresAt: active ? expiresAt : null,
+    autoRenewing: active && Number(row?.autoRenewing) === 1,
+    chargeId: active ? cleanPaymentChargeId(row?.chargeId) : null
+  };
+}
+
+async function proSubscriptionStatus(env, chatId) {
+  const row = await env.DB.prepare(
+    `SELECT expires_at AS expiresAt, auto_renewing AS autoRenewing,
+            telegram_payment_charge_id AS chargeId
+     FROM pro_subscriptions WHERE chat_id = ? LIMIT 1`
+  ).bind(chatId).first();
+  return proSubscriptionFromRow(row);
+}
+
+async function updateProSubscription(request, env) {
+  if (!hasInternalSecret(request, env)) return json({ ok: false, error: "Forbidden" }, 403);
+  if (request.method !== "POST") return json({ ok: false, error: "Method not allowed" }, 405);
+
+  const payload = await requestPayload(request);
+  const action = String(payload?.action || "");
+  const chatId = cleanChatId(payload?.chatId);
+  if (!chatId || !["status", "grant", "set_auto_renewal"].includes(action)) {
+    return json({ ok: false, error: "Invalid Pro subscription request" }, 400);
+  }
+
+  if (action === "status") {
+    return json({ ok: true, subscription: await proSubscriptionStatus(env, chatId) });
+  }
+
+  if (action === "set_auto_renewal") {
+    if (typeof payload?.autoRenewing !== "boolean") {
+      return json({ ok: false, error: "Invalid auto renewal setting" }, 400);
+    }
+    const current = await proSubscriptionStatus(env, chatId);
+    if (!current.active) return json({ ok: false, error: "No active Pro subscription" }, 409);
+    await env.DB.prepare(
+      "UPDATE pro_subscriptions SET auto_renewing = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?"
+    ).bind(payload.autoRenewing ? 1 : 0, chatId).run();
+    return json({ ok: true, subscription: await proSubscriptionStatus(env, chatId) });
+  }
+
+  const expiresAt = cleanProExpiry(payload?.expiresAt);
+  const chargeId = cleanPaymentChargeId(payload?.chargeId);
+  const isFirstRecurring = payload?.isFirstRecurring === true;
+  if (!expiresAt || !chargeId) return json({ ok: false, error: "Invalid Pro payment" }, 400);
+
+  const paymentInsert = await env.DB.prepare(
+    `INSERT OR IGNORE INTO pro_payments
+       (telegram_payment_charge_id, chat_id, expires_at, is_first_recurring, created_at)
+     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`
+  ).bind(chargeId, chatId, expiresAt, isFirstRecurring ? 1 : 0).run();
+  const newPayment = Number(paymentInsert.meta?.changes) > 0;
+
+  if (newPayment) {
+    const existing = await env.DB.prepare(
+      "SELECT telegram_payment_charge_id AS chargeId FROM pro_subscriptions WHERE chat_id = ? LIMIT 1"
+    ).bind(chatId).first();
+    const replaceChargeId = isFirstRecurring || !cleanPaymentChargeId(existing?.chargeId);
+    await env.DB.prepare(
+      `INSERT INTO pro_subscriptions
+         (chat_id, expires_at, telegram_payment_charge_id, auto_renewing, last_payment_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT(chat_id) DO UPDATE SET
+         expires_at = CASE WHEN excluded.expires_at > pro_subscriptions.expires_at
+           THEN excluded.expires_at ELSE pro_subscriptions.expires_at END,
+         telegram_payment_charge_id = CASE WHEN ? = 1
+           THEN excluded.telegram_payment_charge_id ELSE pro_subscriptions.telegram_payment_charge_id END,
+         auto_renewing = CASE WHEN ? = 1 THEN 1 ELSE pro_subscriptions.auto_renewing END,
+         last_payment_at = excluded.last_payment_at,
+         updated_at = CURRENT_TIMESTAMP`
+    ).bind(
+      chatId,
+      expiresAt,
+      chargeId,
+      replaceChargeId ? 1 : 0,
+      epochSeconds(),
+      replaceChargeId ? 1 : 0,
+      replaceChargeId ? 1 : 0
+    ).run();
+  }
+
+  return json({
+    ok: true,
+    newPayment,
+    subscription: await proSubscriptionStatus(env, chatId)
+  });
+}
+
 function idsFrom(value) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map(cleanChatId).filter(Boolean))].slice(0, MAX_RECIPIENTS_PER_RUN);
@@ -116,15 +228,19 @@ async function deliverScheduledWeather(env) {
     throw new Error("Notification Worker is missing its Render URL or shared secret");
   }
   const result = await env.DB.prepare(
-    `SELECT chat_id AS chatId, city
+    `SELECT weather_subscriptions.chat_id AS chatId, weather_subscriptions.city,
+            CASE WHEN pro_subscriptions.expires_at > ? THEN 1 ELSE 0 END AS pro
      FROM weather_subscriptions
-     WHERE enabled = 1
-     ORDER BY CASE WHEN last_sent_at IS NULL THEN 0 ELSE 1 END ASC, last_sent_at ASC
+     LEFT JOIN pro_subscriptions ON pro_subscriptions.chat_id = weather_subscriptions.chat_id
+     WHERE weather_subscriptions.enabled = 1
+     ORDER BY CASE WHEN weather_subscriptions.last_sent_at IS NULL THEN 0 ELSE 1 END ASC,
+              weather_subscriptions.last_sent_at ASC
      LIMIT ?`
-  ).bind(MAX_RECIPIENTS_PER_RUN).all();
+  ).bind(epochSeconds(), MAX_RECIPIENTS_PER_RUN).all();
   const subscribers = (result.results || []).map((row) => ({
     chatId: cleanChatId(row.chatId),
-    city: cleanCity(row.city)
+    city: cleanCity(row.city),
+    pro: Number(row.pro) === 1
   })).filter((row) => row.chatId && row.city);
   if (!subscribers.length) return { attempted: 0, delivered: 0, disabled: 0 };
 
@@ -152,6 +268,7 @@ export default {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") return json({ ok: true });
     if (url.pathname === "/v1/subscriptions") return updateSubscription(request, env);
+    if (url.pathname === "/v1/pro") return updateProSubscription(request, env);
     return json({ ok: false, error: "Not found" }, 404);
   },
 

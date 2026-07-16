@@ -24,6 +24,23 @@ feature keeps working while the Free Render web service is asleep.
 The two services authenticate each other with the `WEATHER_NOTIFICATIONS_SHARED_SECRET`
 environment variable. Keep that value in platform secrets only; never commit it.
 
+## SkyPulse Pro and Telegram Stars
+
+The Weather tab includes a monthly **SkyPulse Pro** subscription. It is billed in
+Telegram Stars and unlocks richer weather updates: an outfit suggestion plus an
+important rain, wind, or thunderstorm warning when appropriate. The price defaults
+to 49 Stars per 30 days and can be changed with `PRO_MONTHLY_PRICE_STARS`.
+
+Invoices are created server-side and bound to the Telegram user who opened the Mini
+App. The bot validates every pre-checkout request, then persists the paid access in
+the Cloudflare D1 database. It also handles renewal and lets the user disable or
+restore automatic renewal from the Mini App.
+
+Before offering paid access publicly, configure `PAYMENT_SUPPORT_USERNAME` with the
+Telegram username that will answer payment questions. The bot responds to
+`/paysupport` and directs users there. Do not put payment keys or the notification
+shared secret in source control.
+
 ## Smart transport search
 
 The Mini App shows departures for the next two hours in Grodno time. It switches to the weekend timetable on Saturdays, Sundays, Belarusian statutory non-working holidays (including Radunitsa), and officially transferred days off.

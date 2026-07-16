@@ -33,6 +33,13 @@ const MINI_APP_ALLOW_LOCAL_UNVERIFIED = process.env.MINI_APP_ALLOW_LOCAL_UNVERIF
 const WEATHER_NOTIFICATIONS_WORKER_URL = String(process.env.WEATHER_NOTIFICATIONS_WORKER_URL || "").trim().replace(/\/$/, "");
 const WEATHER_NOTIFICATIONS_SHARED_SECRET = String(process.env.WEATHER_NOTIFICATIONS_SHARED_SECRET || "").trim();
 const WEATHER_NOTIFICATIONS_DELIVERY_PATH = "/internal/weather-notifications/deliver";
+const PRO_PRODUCT_CODE = "skypulse-pro-monthly-v1";
+const PRO_MONTHLY_PRICE_STARS = boundedIntegerEnv("PRO_MONTHLY_PRICE_STARS", 49, 1, 10000);
+const PRO_SUBSCRIPTION_PERIOD_SECONDS = 30 * 24 * 60 * 60;
+const PRO_INVOICE_TTL_SECONDS = 20 * 60;
+const PRO_PAYMENTS_ENABLED = process.env.PRO_PAYMENTS_ENABLED !== "false";
+const PRO_PAYMENT_SIGNING_SECRET = String(process.env.PRO_PAYMENT_SIGNING_SECRET || BOT_TOKEN || "");
+const PAYMENT_SUPPORT_USERNAME = String(process.env.PAYMENT_SUPPORT_USERNAME || "").trim().replace(/^@+/, "");
 const GRODNO_TIME_ZONE = "Europe/Minsk";
 const BELARUS_WEEKEND_SERVICE_DATES = configuredWeekendServiceDates(process.env.BELARUS_WEEKEND_SERVICE_DATES);
 const MAX_MESSAGE_TEXT_LENGTH = 160;
@@ -95,6 +102,11 @@ let offset = 0;
 let lastStateCleanupAt = 0;
 let nominatimQueue = Promise.resolve();
 let nextNominatimRequestAt = 0;
+
+function boundedIntegerEnv(name, fallback, minimum, maximum) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value >= minimum && value <= maximum ? value : fallback;
+}
 
 process.on("unhandledRejection", (error) => {
   console.error("Unhandled rejection:", error?.message || error);
@@ -173,6 +185,89 @@ function miniAppClientKey(req, authorization = null) {
   if (authorization?.key) return authorization.key;
   const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
   return forwarded || req.socket?.remoteAddress || "unknown";
+}
+
+function telegramUserId(value) {
+  const userId = String(value || "");
+  return /^\d{1,20}$/.test(userId) ? userId : null;
+}
+
+function constantTimeTextEqual(left, right) {
+  if (typeof left !== "string" || typeof right !== "string" || !left || !right) return false;
+  const first = Buffer.from(left);
+  const second = Buffer.from(right);
+  return first.length === second.length && crypto.timingSafeEqual(first, second);
+}
+
+function proInvoiceSignature(base, signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  if (!signingSecret) return "";
+  return crypto.createHmac("sha256", signingSecret).update(base).digest("base64url").slice(0, 32);
+}
+
+function createProInvoicePayload(userId, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const recipient = telegramUserId(userId);
+  const issuedAt = Number(nowSeconds);
+  if (!recipient || !Number.isInteger(issuedAt) || !signingSecret) {
+    throw new Error("Could not create a Pro invoice payload");
+  }
+  const expiresAt = issuedAt + PRO_INVOICE_TTL_SECONDS;
+  const nonce = crypto.randomBytes(12).toString("base64url");
+  const base = `${PRO_PRODUCT_CODE}.${recipient}.${expiresAt}.${nonce}`;
+  return `${base}.${proInvoiceSignature(base, signingSecret)}`;
+}
+
+function parseProInvoicePayload(value, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const payload = String(value || "");
+  const now = Number(nowSeconds);
+  if (!Number.isInteger(now) || !signingSecret || payload.length > 128) return null;
+
+  const parts = payload.split(".");
+  if (parts.length !== 5 || parts[0] !== PRO_PRODUCT_CODE) return null;
+  const [, rawUserId, rawExpiresAt, nonce, signature] = parts;
+  const userId = telegramUserId(rawUserId);
+  const expiresAt = Number(rawExpiresAt);
+  if (!userId || !Number.isSafeInteger(expiresAt) || !/^[A-Za-z0-9_-]{16}$/.test(nonce) || !/^[A-Za-z0-9_-]{32}$/.test(signature)) {
+    return null;
+  }
+  if (expiresAt <= now || expiresAt > now + PRO_INVOICE_TTL_SECONDS + 5 * 60) return null;
+
+  const base = `${PRO_PRODUCT_CODE}.${userId}.${expiresAt}.${nonce}`;
+  if (!constantTimeTextEqual(signature, proInvoiceSignature(base, signingSecret))) return null;
+  return { userId, expiresAt };
+}
+
+function proCheckoutDetails(value, payerId, currency, totalAmount, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const invoice = parseProInvoicePayload(value, nowSeconds, signingSecret);
+  const payer = telegramUserId(payerId);
+  if (!invoice || !payer || invoice.userId !== payer || currency !== "XTR" || Number(totalAmount) !== PRO_MONTHLY_PRICE_STARS) {
+    return null;
+  }
+  return invoice;
+}
+
+function proPaymentChargeId(value) {
+  const chargeId = String(value || "").trim();
+  return chargeId.length >= 1 && chargeId.length <= 256 && !/[\r\n\u0000]/.test(chargeId) ? chargeId : null;
+}
+
+function proSuccessfulPaymentDetails(payment, payerId, nowSeconds = Math.floor(Date.now() / 1000), signingSecret = PRO_PAYMENT_SIGNING_SECRET) {
+  const invoice = proCheckoutDetails(
+    payment?.invoice_payload,
+    payerId,
+    payment?.currency,
+    payment?.total_amount,
+    nowSeconds,
+    signingSecret
+  );
+  const expiresAt = Number(payment?.subscription_expiration_date);
+  const chargeId = proPaymentChargeId(payment?.telegram_payment_charge_id);
+  if (!invoice || !Number.isSafeInteger(expiresAt) || expiresAt <= Number(nowSeconds) || !chargeId) return null;
+  return {
+    ...invoice,
+    expiresAt,
+    chargeId,
+    isFirstRecurring: payment?.is_first_recurring === true
+  };
 }
 
 function isMiniAppApiRateLimited(req, authorization) {
@@ -567,6 +662,7 @@ function menuKeyboard(lang) {
         { text: LABELS[lang].help, callback_data: "help" },
         { text: LABELS[lang].language, callback_data: "choose_lang" }
       ],
+      [{ text: lang === "en" ? "✨ SkyPulse Pro" : "✨ SkyPulse Pro", callback_data: "pro" }],
       [{ text: lang === "en" ? "ℹ️ Information" : "ℹ️ Информация", callback_data: "info_menu" }]
     ]
   };
@@ -667,6 +763,56 @@ function menuText(lang) {
   ].join("\n");
 }
 
+function paymentSupportContact() {
+  return /^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(PAYMENT_SUPPORT_USERNAME)
+    ? `@${PAYMENT_SUPPORT_USERNAME}`
+    : null;
+}
+
+function paymentSupportText(lang) {
+  const contact = paymentSupportContact();
+  if (lang === "en") {
+    return [
+      "<b>SkyPulse Pro payment support</b>",
+      "If payment succeeded but Pro was not enabled, do not pay a second time. Keep the receipt and payment message.",
+      contact ? `Contact: ${escapeHtml(contact)}` : "The support contact is being set up. Please keep the receipt until it appears here."
+    ].join("\n");
+  }
+  return [
+    "<b>Поддержка по оплате SkyPulse Pro</b>",
+    "Если платёж прошёл, а Pro не включился, не плати второй раз. Сохрани чек и сообщение о платеже.",
+    contact ? `Напиши: ${escapeHtml(contact)}` : "Контакт поддержки сейчас настраивается. Сохрани чек — он понадобится для проверки."
+  ].join("\n");
+}
+
+function proInfoText(lang) {
+  if (lang === "en") {
+    return [
+      "<b>✨ SkyPulse Pro</b>",
+      `For ${PRO_MONTHLY_PRICE_STARS} Telegram Stars every 30 days: outfit guidance and rain, wind, and thunderstorm warnings in weather notifications.`,
+      "The subscription renews automatically and can be disabled at any time in the Mini App."
+    ].join("\n");
+  }
+  return [
+    "<b>✨ SkyPulse Pro</b>",
+    `${PRO_MONTHLY_PRICE_STARS} Telegram Stars за 30 дней: совет по одежде и предупреждения о ливне, ветре и грозе в уведомлениях о погоде.`,
+    "Подписка продлевается автоматически, её можно отключить в любой момент внутри мини-приложения."
+  ].join("\n");
+}
+
+function proInfoKeyboard(lang) {
+  const url = getMiniAppUrl();
+  return {
+    inline_keyboard: [
+      [url
+        ? { text: lang === "en" ? "✨ Open SkyPulse Pro" : "✨ Открыть SkyPulse Pro", web_app: { url } }
+        : { text: lang === "en" ? "🚌 Open Mini App" : "🚌 Открыть мини-приложение", callback_data: "transport_menu" }
+      ],
+      [{ text: lang === "en" ? "💳 Payment support" : "💳 Поддержка по оплате", callback_data: "paysupport" }]
+    ]
+  };
+}
+
 function helpText(lang) {
   if (lang === "en") {
     return [
@@ -674,6 +820,7 @@ function helpText(lang) {
       "1. Forecast for today or tomorrow.",
       "2. Forecast for an exact hour, like 15 or 15:00.",
       "3. Clothing advice after the forecast.",
+      "4. /pro — SkyPulse Pro and payment options.",
       "",
       "Example: Weather tomorrow -> type London -> Afternoon 15:00 -> What should I wear?"
     ].join("\n");
@@ -684,6 +831,7 @@ function helpText(lang) {
     "1. Прогноз на сегодня или завтра.",
     "2. Прогноз на конкретный час: например 15 или 15:00.",
     "3. Подсказка по одежде после прогноза.",
+    "4. /pro — SkyPulse Pro и оплата.",
     "",
     "Пример: «Погода завтра» -> напиши Москва -> «День 15:00» -> «А что по одежде?»."
   ].join("\n");
@@ -892,6 +1040,83 @@ async function sendMessage(chatId, text, extra = {}) {
     parse_mode: "HTML",
     ...extra
   });
+}
+
+function formatProExpiration(expiresAt) {
+  try {
+    return new Intl.DateTimeFormat("ru-RU", {
+      timeZone: GRODNO_TIME_ZONE,
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    }).format(new Date(Number(expiresAt) * 1000));
+  } catch {
+    return "конца текущего периода";
+  }
+}
+
+async function handlePreCheckoutQuery(preCheckoutQuery) {
+  if (!preCheckoutQuery?.id) return;
+  const userId = telegramUserId(preCheckoutQuery?.from?.id);
+  const details = userId && proPaymentsConfigured()
+    ? proCheckoutDetails(
+        preCheckoutQuery?.invoice_payload,
+        userId,
+        preCheckoutQuery?.currency,
+        preCheckoutQuery?.total_amount
+      )
+    : null;
+  const accepted = Boolean(details && preCheckoutQuery?.id);
+  await telegram("answerPreCheckoutQuery", {
+    pre_checkout_query_id: preCheckoutQuery?.id,
+    ok: accepted,
+    ...(accepted ? {} : { error_message: "Счёт устарел или временно недоступен. Открой SkyPulse Pro ещё раз." })
+  });
+}
+
+async function handleSuccessfulPayment(message) {
+  const payment = message?.successful_payment;
+  if (!payment) return;
+
+  const parsedInvoice = parseProInvoicePayload(payment.invoice_payload);
+  const payerId = telegramUserId(message?.from?.id) || parsedInvoice?.userId || null;
+  const details = payerId ? proSuccessfulPaymentDetails(payment, payerId) : null;
+  if (!details) {
+    console.warn("Ignored an invalid successful payment update.");
+    return;
+  }
+
+  if (!proPaymentsConfigured()) {
+    console.error("Received a valid SkyPulse Pro payment while the entitlement service is unavailable.");
+    throw new Error("SkyPulse Pro entitlement service is unavailable");
+  }
+
+  let result;
+  try {
+    result = await syncProSubscription("grant", details.userId, {
+      expiresAt: details.expiresAt,
+      chargeId: details.chargeId,
+      isFirstRecurring: details.isFirstRecurring
+    });
+  } catch (error) {
+    console.error("Could not grant SkyPulse Pro after payment:", error.message);
+    throw error;
+  }
+
+  if (result.newPayment) {
+    try {
+      await sendMessage(details.userId, [
+        "✨ <b>SkyPulse Pro активирован</b>",
+        `Доступ действует до ${escapeHtml(formatProExpiration(details.expiresAt))}.`,
+        "Теперь сообщения о погоде будут включать совет по одежде и важные предупреждения.",
+        "Автопродление можно отключить в карточке Pro внутри мини-приложения."
+      ].join("\n"));
+    } catch (error) {
+      console.error("Could not send SkyPulse Pro confirmation:", error.message);
+    }
+  }
 }
 
 async function removeReplyKeyboard(chatId) {
@@ -2784,6 +3009,16 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
+  if (data === "pro") {
+    await sendMessage(chatId, proInfoText(lang), { reply_markup: proInfoKeyboard(lang) });
+    return;
+  }
+
+  if (data === "paysupport") {
+    await sendMessage(chatId, paymentSupportText(lang), { reply_markup: proInfoKeyboard(lang) });
+    return;
+  }
+
   if (data === "info_menu") {
     await showInformation(chatId);
     return;
@@ -3011,6 +3246,10 @@ async function handleCallbackQuery(callbackQuery) {
 }
 
 async function handleMessage(message) {
+  if (message?.successful_payment) {
+    await handleSuccessfulPayment(message);
+    return;
+  }
   const chatId = message.chat.id;
   const text = (message.text || "").trim();
   if (!text) return;
@@ -3049,6 +3288,16 @@ async function handleMessage(message) {
     return;
   }
 
+  if (command === "/pro") {
+    await sendMessage(chatId, proInfoText(lang), { reply_markup: proInfoKeyboard(lang) });
+    return;
+  }
+
+  if (command === "/paysupport") {
+    await sendMessage(chatId, paymentSupportText(lang), { reply_markup: proInfoKeyboard(lang) });
+    return;
+  }
+
   const activeSession = userSessions.get(chatId);
   if (activeSession) {
     await handleSession(chatId, text, activeSession);
@@ -3064,7 +3313,7 @@ async function poll() {
     const updates = await telegram("getUpdates", {
       offset,
       timeout: 25,
-      allowed_updates: ["message", "callback_query"]
+      allowed_updates: ["message", "callback_query", "pre_checkout_query"]
     });
 
     for (const update of updates) {
@@ -3080,6 +3329,14 @@ async function poll() {
 }
 
 async function handleUpdate(update) {
+  if (update.pre_checkout_query) {
+    await handlePreCheckoutQuery(update.pre_checkout_query);
+    return;
+  }
+  if (update.message?.successful_payment) {
+    await handleSuccessfulPayment(update.message);
+    return;
+  }
   try {
     if (update.callback_query) {
       await handleCallbackQuery(update.callback_query);
@@ -3103,7 +3360,7 @@ async function configureWebhook(baseUrl) {
   await telegram("deleteWebhook", { drop_pending_updates: false });
   await telegram("setWebhook", {
     url: webhookUrl,
-    allowed_updates: ["message", "callback_query"],
+    allowed_updates: ["message", "callback_query", "pre_checkout_query"],
     secret_token: WEBHOOK_SECRET || undefined
   });
   console.log(`Telegram webhook set for host: ${new URL(webhookUrl).host}`);
@@ -3289,6 +3546,9 @@ function miniAppHtml() {
     .weather-notification-card { padding: 12px; margin-top: 12px; border: 1px solid var(--border); border-radius: 13px; }
     .weather-notification-card p { margin-top: 7px; }
     .weather-notification-card button { width: 100%; margin-top: 10px; }
+    .pro-card { padding: 13px; margin-top: 12px; border: 1px solid color-mix(in srgb, var(--accent) 58%, var(--border)); border-radius: 13px; background: color-mix(in srgb, var(--accent) 10%, var(--card)); }
+    .pro-card p { margin-top: 7px; }
+    .pro-card button { width: 100%; margin-top: 10px; }
     .assistant-card { margin-top: 16px; }
     .assistant-form { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin-top: 12px; }
     .assistant-result { margin-top: 10px; }
@@ -3355,6 +3615,13 @@ function miniAppHtml() {
           <p class="muted">Бот будет присылать текущую погоду в личный чат. Подписку можно выключить в любой момент.</p>
           <button id="weather-notification-toggle" type="button" disabled>Проверяю подписку…</button>
           <div id="weather-notification-notice" class="notice" role="status"></div>
+        </div>
+        <div class="pro-card">
+          <strong>✨ SkyPulse Pro</strong>
+          <p class="muted">Расширенные уведомления: что надеть и важные предупреждения о ливне, сильном ветре или грозе.</p>
+          <p class="muted">${PRO_MONTHLY_PRICE_STARS} ⭐ за 30 дней. Подписка продлевается автоматически, её можно отключить в любой момент.</p>
+          <button id="pro-toggle" type="button" disabled>Проверяю SkyPulse Pro…</button>
+          <div id="pro-notice" class="notice" role="status"></div>
         </div>
       </div>
     </section>
@@ -3487,6 +3754,9 @@ function miniAppHtml() {
       var weatherNotificationNotice = document.getElementById("weather-notification-notice");
       var weatherNotification = { city: "", subscribed: false, subscribedCity: null, busy: false };
       var weatherNotificationRequestId = 0;
+      var proToggle = document.getElementById("pro-toggle");
+      var proNotice = document.getElementById("pro-notice");
+      var pro = { active: false, expiresAt: null, autoRenewing: false, busy: false, loaded: false };
       var assistantForm = document.getElementById("assistant-form");
       var assistantQuery = document.getElementById("assistant-query");
       var assistantNotice = document.getElementById("assistant-notice");
@@ -3618,6 +3888,136 @@ function miniAppHtml() {
           if (requestId !== weatherNotificationRequestId) return;
           weatherNotification.busy = false;
           updateWeatherNotificationToggle();
+        });
+      }
+
+      function setProNotice(text, isError) {
+        proNotice.textContent = text || "";
+        proNotice.className = isError ? "notice error" : "notice";
+      }
+
+      function proExpirationText(expiresAt) {
+        var date = new Date(Number(expiresAt) * 1000);
+        if (!isFinite(date.getTime())) return "конца периода";
+        try {
+          return new Intl.DateTimeFormat("ru-RU", {
+            timeZone: "Europe/Minsk", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit"
+          }).format(date);
+        } catch (_) {
+          return date.toLocaleString("ru-RU");
+        }
+      }
+
+      function applyProSubscription(subscription) {
+        var expiresAt = Number(subscription && subscription.expiresAt);
+        pro.active = Boolean(subscription && subscription.active && isFinite(expiresAt) && expiresAt > 0);
+        pro.expiresAt = pro.active ? expiresAt : null;
+        pro.autoRenewing = Boolean(pro.active && subscription && subscription.autoRenewing);
+        pro.loaded = true;
+        updateProToggle();
+      }
+
+      function updateProToggle() {
+        proToggle.disabled = !pro.loaded || pro.busy;
+        if (pro.busy) {
+          proToggle.textContent = "Сохраняю…";
+        } else if (!pro.loaded) {
+          proToggle.textContent = "Проверяю SkyPulse Pro…";
+        } else if (!pro.active) {
+          proToggle.textContent = "✨ Оформить Pro · ${PRO_MONTHLY_PRICE_STARS} ⭐";
+        } else if (pro.autoRenewing) {
+          proToggle.textContent = "🔕 Отключить автопродление";
+        } else {
+          proToggle.textContent = "🔔 Включить автопродление";
+        }
+      }
+
+      function refreshPro() {
+        if (pro.busy) return Promise.resolve();
+        pro.busy = true;
+        updateProToggle();
+        return postJson("/api/pro", { action: "status" }).then(function (data) {
+          applyProSubscription(data.subscription || {});
+          if (pro.active) {
+            setProNotice("Pro активен до " + proExpirationText(pro.expiresAt) + (pro.autoRenewing ? ". Автопродление включено." : ". Автопродление выключено."), false);
+          } else {
+            setProNotice("", false);
+          }
+        }).catch(function () {
+          pro.loaded = false;
+          pro.active = false;
+          setProNotice("SkyPulse Pro пока недоступен. Попробуй чуть позже.", true);
+        }).finally(function () {
+          pro.busy = false;
+          updateProToggle();
+        });
+      }
+
+      function waitForProActivation(attempt) {
+        setTimeout(function () {
+          refreshPro().then(function () {
+            if (!pro.active && attempt < 4) waitForProActivation(attempt + 1);
+          });
+        }, attempt === 0 ? 800 : 1400);
+      }
+
+      function openProInvoice() {
+        if (!telegram || typeof telegram.openInvoice !== "function") {
+          setProNotice("Открой мини-приложение из Telegram, чтобы оплатить Pro Stars.", true);
+          return;
+        }
+        pro.busy = true;
+        updateProToggle();
+        setProNotice("Готовлю счёт в Stars…", false);
+        postJson("/api/pro", { action: "invoice" }).then(function (data) {
+          applyProSubscription(data.subscription || {});
+          if (pro.active) {
+            setProNotice("Pro уже активен до " + proExpirationText(pro.expiresAt) + ".", false);
+            return;
+          }
+          if (!data.invoiceUrl) throw new Error("invoice is missing");
+          pro.busy = false;
+          updateProToggle();
+          telegram.openInvoice(data.invoiceUrl, function (status) {
+            if (status === "paid") {
+              setProNotice("Оплата прошла. Активирую Pro…", false);
+              waitForProActivation(0);
+            } else if (status === "cancelled") {
+              setProNotice("Оплата отменена.", false);
+            } else if (status === "failed") {
+              setProNotice("Оплата не прошла. Попробуй ещё раз чуть позже.", true);
+            }
+          });
+        }).catch(function () {
+          setProNotice("Не получилось открыть оплату. Попробуй ещё раз чуть позже.", true);
+        }).finally(function () {
+          if (pro.busy) {
+            pro.busy = false;
+            updateProToggle();
+          }
+        });
+      }
+
+      function toggleProSubscription() {
+        if (!pro.loaded || pro.busy) return;
+        if (!pro.active) {
+          openProInvoice();
+          return;
+        }
+        var action = pro.autoRenewing ? "cancel" : "resume";
+        pro.busy = true;
+        updateProToggle();
+        setProNotice(action === "cancel" ? "Отключаю автопродление…" : "Включаю автопродление…", false);
+        postJson("/api/pro", { action: action }).then(function (data) {
+          applyProSubscription(data.subscription || {});
+          setProNotice(pro.autoRenewing
+            ? "Автопродление включено."
+            : "Автопродление выключено: Pro будет работать до " + proExpirationText(pro.expiresAt) + ".", false);
+        }).catch(function () {
+          setProNotice("Не получилось изменить автопродление. Попробуй ещё раз позже.", true);
+        }).finally(function () {
+          pro.busy = false;
+          updateProToggle();
         });
       }
 
@@ -4046,6 +4446,7 @@ function miniAppHtml() {
         clothingToggle.setAttribute("aria-expanded", clothingCard.hidden ? "false" : "true");
       });
       weatherNotificationToggle.addEventListener("click", toggleWeatherNotification);
+      proToggle.addEventListener("click", toggleProSubscription);
       tripForm.addEventListener("submit", function (event) {
         event.preventDefault();
         var from = String(tripFrom.value || "").trim();
@@ -4114,6 +4515,8 @@ function miniAppHtml() {
       try { initialCity = localStorage.getItem("skypulse-city") || initialCity; } catch (_) {}
       weatherCityInput.value = initialCity;
       switchSection("weather");
+      updateProToggle();
+      refreshPro();
       loadWeather(initialCity);
     }());
   </script>
@@ -4151,6 +4554,70 @@ function weatherNotificationsConfigured() {
   }
 }
 
+function proPaymentsConfigured() {
+  return PRO_PAYMENTS_ENABLED && Boolean(BOT_TOKEN) && Boolean(PRO_PAYMENT_SIGNING_SECRET) && weatherNotificationsConfigured();
+}
+
+function proSubscriptionFromWorker(value) {
+  const active = value?.active === true;
+  const expiresAt = Number(value?.expiresAt);
+  if (!active || !Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
+    return { active: false, expiresAt: null, autoRenewing: false, chargeId: null };
+  }
+  return {
+    active: true,
+    expiresAt,
+    autoRenewing: value?.autoRenewing === true,
+    chargeId: proPaymentChargeId(value?.chargeId)
+  };
+}
+
+function publicProSubscription(subscription) {
+  return {
+    active: Boolean(subscription?.active),
+    expiresAt: subscription?.active ? subscription.expiresAt : null,
+    autoRenewing: Boolean(subscription?.active && subscription?.autoRenewing)
+  };
+}
+
+async function syncProSubscription(action, chatId, extra = {}) {
+  if (!proPaymentsConfigured()) throw new Error("SkyPulse Pro is not configured");
+  const response = await fetchJson(`${WEATHER_NOTIFICATIONS_WORKER_URL}/v1/pro`, {
+    method: "POST",
+    timeoutMs: 12000,
+    maxBytes: 64 * 1024,
+    label: "SkyPulse Pro subscription",
+    headers: {
+      "Content-Type": "application/json",
+      "X-SkyPulse-Notification-Secret": WEATHER_NOTIFICATIONS_SHARED_SECRET
+    },
+    body: JSON.stringify({ action, chatId, ...extra })
+  });
+  if (!response?.ok || !response.subscription) {
+    throw new Error("SkyPulse Pro service returned an invalid response");
+  }
+  return {
+    subscription: proSubscriptionFromWorker(response.subscription),
+    newPayment: response.newPayment === true
+  };
+}
+
+async function createProInvoiceLink(userId) {
+  if (!proPaymentsConfigured()) throw new Error("SkyPulse Pro is not configured");
+  const invoiceUrl = await telegram("createInvoiceLink", {
+    title: "SkyPulse Pro",
+    description: "Умные уведомления о погоде с советом по одежде и предупреждениями.",
+    payload: createProInvoicePayload(userId),
+    currency: "XTR",
+    prices: [{ label: "SkyPulse Pro · 30 дней", amount: PRO_MONTHLY_PRICE_STARS }],
+    subscription_period: PRO_SUBSCRIPTION_PERIOD_SECONDS
+  });
+  if (typeof invoiceUrl !== "string" || !/^https:\/\//i.test(invoiceUrl)) {
+    throw new Error("Telegram returned an invalid SkyPulse Pro invoice link");
+  }
+  return invoiceUrl;
+}
+
 async function syncWeatherNotificationSubscription(action, chatId, city = null) {
   if (!weatherNotificationsConfigured()) throw new Error("Weather notifications are not configured");
   const response = await fetchJson(`${WEATHER_NOTIFICATIONS_WORKER_URL}/v1/subscriptions`, {
@@ -4177,10 +4644,31 @@ async function syncWeatherNotificationSubscription(action, chatId, city = null) 
 function weatherNotificationSubscriber(value) {
   const chatId = String(value?.chatId || "");
   const city = miniAppCityQuery(value?.city);
-  return /^\d{1,20}$/.test(chatId) && city ? { chatId, city } : null;
+  if (!/^\d{1,20}$/.test(chatId) || !city) return null;
+  return value?.pro === true || Number(value?.pro) === 1 ? { chatId, city, pro: true } : { chatId, city };
 }
 
-function formatWeatherNotification(city, weather) {
+function proWeatherAlert(weather, currentCode) {
+  const precipitation = miniAppRounded(weather.daily?.precipitation_probability_max?.[0]) || 0;
+  const wind = miniAppRounded(weather.current?.wind_speed_10m);
+  if (currentCode >= 95) return "Гроза: по возможности пережди её в помещении и не стой рядом с высокими деревьями.";
+  if (wind != null && wind >= 35) return `Сильный ветер ${wind} км/ч: закрепи капюшон и будь внимательнее рядом с деревьями.`;
+  if (precipitation >= 70) return `Осадки вероятны (${precipitation}%): лучше взять зонт или непромокаемый слой.`;
+  return null;
+}
+
+function formatProWeatherNotificationDetails(city, weather, currentCode) {
+  const clothing = getMiniAppClothingAdvice(city, weather, weather.current || {}, currentCode);
+  const alert = proWeatherAlert(weather, currentCode);
+  return [
+    "",
+    "✨ <b>SkyPulse Pro</b>",
+    clothing?.base ? `🧥 На улицу: ${escapeHtml(clothing.base)}.` : null,
+    alert ? `⚠️ ${escapeHtml(alert)}` : null
+  ];
+}
+
+function formatWeatherNotification(city, weather, options = {}) {
   const current = weather.current || {};
   const currentCode = Number(current.weather_code);
   const min = miniAppRounded(weather.daily?.temperature_2m_min?.[0]);
@@ -4190,7 +4678,7 @@ function formatWeatherNotification(city, weather) {
   const apparent = miniAppRounded(current.apparent_temperature);
   const wind = miniAppRounded(current.wind_speed_10m);
   const description = escapeHtml(describeWeatherCode(currentCode, "ru"));
-  return [
+  const lines = [
     "🔔 <b>Погода каждые 3 часа</b>",
     `<b>${formatSafeCityName(city)}</b>`,
     "",
@@ -4199,7 +4687,9 @@ function formatWeatherNotification(city, weather) {
     wind == null ? null : `💨 Ветер: ${wind} км/ч`,
     min == null || max == null ? null : `Сегодня: ${min}…${max}°C`,
     precipitation == null ? null : `💧 Вероятность осадков: ${precipitation}%`
-  ].filter(Boolean).join("\n");
+  ];
+  if (options?.pro === true) lines.push(...formatProWeatherNotificationDetails(city, weather, currentCode));
+  return lines.filter(Boolean).join("\n");
 }
 
 function telegramDestinationUnavailable(error) {
@@ -4227,14 +4717,14 @@ async function mapWithConcurrency(items, limit, task) {
 
 async function deliverWeatherNotificationBatch(subscribers) {
   const cityMessages = new Map();
-  const messageForCity = async (cityQuery) => {
-    const key = cityQuery.toLocaleLowerCase("ru");
+  const messageForCity = async (cityQuery, pro = false) => {
+    const key = `${cityQuery.toLocaleLowerCase("ru")}:${pro ? "pro" : "free"}`;
     if (!cityMessages.has(key)) {
       cityMessages.set(key, (async () => {
         const city = await findCity(cityQuery, "ru");
         if (!city) throw new Error("Notification city was not found");
         const weather = await getWeather(city);
-        return formatWeatherNotification(city, weather);
+        return formatWeatherNotification(city, weather, { pro });
       })());
     }
     return cityMessages.get(key);
@@ -4242,7 +4732,7 @@ async function deliverWeatherNotificationBatch(subscribers) {
 
   const results = await mapWithConcurrency(subscribers, 4, async (subscriber) => {
     try {
-      const text = await messageForCity(subscriber.city);
+      const text = await messageForCity(subscriber.city, subscriber.pro === true);
       await sendMessage(subscriber.chatId, text, { disable_web_page_preview: true });
       return { status: "delivered", chatId: subscriber.chatId };
     } catch (error) {
@@ -4507,6 +4997,91 @@ async function handleMiniAppRequest(req, res, requestUrl) {
   }
   if (isMiniAppApi && isMiniAppApiRateLimited(req, authorization)) {
     miniAppError(res, 429, "Too many requests. Please wait a minute.");
+    return true;
+  }
+
+  if (requestUrl.pathname === "/api/pro") {
+    if (req.method !== "POST") {
+      miniAppError(res, 405, "Method not allowed");
+      return true;
+    }
+    if (!authorization?.userId) {
+      miniAppError(res, 400, "This Mini App launch has no Telegram user");
+      return true;
+    }
+
+    let payload;
+    try {
+      const body = await readRequestBody(req, 4 * 1024);
+      payload = JSON.parse(body);
+    } catch (error) {
+      miniAppError(res, error?.message === "Request body too large" ? 413 : 400, "Invalid request");
+      return true;
+    }
+
+    const action = String(payload?.action || "").trim();
+    if (!["status", "invoice", "cancel", "resume"].includes(action)) {
+      miniAppError(res, 400, "Invalid Pro request");
+      return true;
+    }
+    if (!proPaymentsConfigured()) {
+      miniAppError(res, 503, "SkyPulse Pro is being set up");
+      return true;
+    }
+
+    try {
+      const current = await syncProSubscription("status", authorization.userId);
+      if (action === "status") {
+        sendJson(res, 200, {
+          ok: true,
+          priceStars: PRO_MONTHLY_PRICE_STARS,
+          subscription: publicProSubscription(current.subscription)
+        });
+        return true;
+      }
+
+      if (action === "invoice") {
+        sendJson(res, 200, {
+          ok: true,
+          priceStars: PRO_MONTHLY_PRICE_STARS,
+          subscription: publicProSubscription(current.subscription),
+          invoiceUrl: current.subscription.active ? null : await createProInvoiceLink(authorization.userId)
+        });
+        return true;
+      }
+
+      if (!current.subscription.active || !current.subscription.chargeId) {
+        miniAppError(res, 409, "No active Pro subscription");
+        return true;
+      }
+
+      const autoRenewing = action === "resume";
+      if (current.subscription.autoRenewing !== autoRenewing) {
+        const telegramUserIdNumber = Number(authorization.userId);
+        if (!Number.isSafeInteger(telegramUserIdNumber)) throw new Error("Invalid Telegram user ID");
+        await telegram("editUserStarSubscription", {
+          user_id: telegramUserIdNumber,
+          telegram_payment_charge_id: current.subscription.chargeId,
+          is_canceled: !autoRenewing
+        });
+        const updated = await syncProSubscription("set_auto_renewal", authorization.userId, { autoRenewing });
+        sendJson(res, 200, {
+          ok: true,
+          priceStars: PRO_MONTHLY_PRICE_STARS,
+          subscription: publicProSubscription(updated.subscription)
+        });
+        return true;
+      }
+
+      sendJson(res, 200, {
+        ok: true,
+        priceStars: PRO_MONTHLY_PRICE_STARS,
+        subscription: publicProSubscription(current.subscription)
+      });
+    } catch (error) {
+      console.error("SkyPulse Pro request error:", error.message);
+      miniAppError(res, 502, "SkyPulse Pro is temporarily unavailable");
+    }
     return true;
   }
 
@@ -4816,9 +5391,23 @@ function startWebhookServer() {
           return;
         }
 
+        const paymentUpdate = Boolean(update.pre_checkout_query || update.message?.successful_payment);
+        if (paymentUpdate) {
+          try {
+            await handleUpdate(update);
+          } catch (error) {
+            console.error("Webhook payment update error:", error.message);
+            res.writeHead(500, securityHeaders());
+            res.end("payment update failed");
+            return;
+          }
+          res.writeHead(200, securityHeaders("application/json; charset=utf-8"));
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
         res.writeHead(200, securityHeaders("application/json; charset=utf-8"));
         res.end(JSON.stringify({ ok: true }));
-
         handleUpdate(update).catch((error) => {
           console.error("Webhook update error:", error.message);
         });
@@ -4892,5 +5481,9 @@ module.exports = {
   psychologistCrisisAnswer,
   miniAppNotificationAction,
   weatherNotificationSubscriber,
-  formatWeatherNotification
+  formatWeatherNotification,
+  createProInvoicePayload,
+  parseProInvoicePayload,
+  proCheckoutDetails,
+  proSuccessfulPaymentDetails
 };
