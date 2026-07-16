@@ -828,14 +828,32 @@ function proInfoText(lang) {
   if (lang === "en") {
     return [
       "<b>✨ SkyPulse Pro</b>",
-      `For ${PRO_MONTHLY_PRICE_STARS} Telegram Stars every 30 days: outfit guidance, a 24-hour weather plan with a recommended trip or walk window, trip building by address with transfers and a map, smart stop search, and rain, wind, and thunderstorm warnings in weather notifications.`,
-      "The subscription renews automatically and can be disabled at any time in the Mini App."
+      "",
+      `<b>${PRO_MONTHLY_PRICE_STARS} ⭐ / 30 days</b>`,
+      "",
+      "<b>What is included:</b>",
+      "• 👕 Outfit guidance for the weather",
+      "• 🗓️ 24-hour weather plan with the best time to travel or walk",
+      "• 🧭 Address-to-address trip planning with transfers and a map",
+      "• 🤖 Smart search for the nearest departures at a stop",
+      "• ⚠️ Rain, strong-wind and thunderstorm alerts",
+      "",
+      "🔁 Renews automatically. Cancel any time in the Mini App."
     ].join("\n");
   }
   return [
     "<b>✨ SkyPulse Pro</b>",
-    `${PRO_MONTHLY_PRICE_STARS} Telegram Stars за 30 дней: совет по одежде, план погоды на 24 часа с лучшим окном для дороги или прогулки, построение поездок по адресам с пересадками и картой, умный поиск по остановке и предупреждения о ливне, ветре и грозе в уведомлениях о погоде.`,
-    "Подписка продлевается автоматически, её можно отключить в любой момент внутри мини-приложения."
+    "",
+    `<b>${PRO_MONTHLY_PRICE_STARS} ⭐ за 30 дней</b>`,
+    "",
+    "<b>Что включено:</b>",
+    "• 👕 Совет по одежде под погоду",
+    "• 🗓️ План погоды на 24 часа — когда лучше ехать или гулять",
+    "• 🧭 Построение поездок: адреса, пересадки и карта",
+    "• 🤖 Умный поиск ближайших рейсов по остановке",
+    "• ⚠️ Предупреждения о ливне, сильном ветре и грозе",
+    "",
+    "🔁 Подписка продлевается автоматически. Отключить её можно в любой момент в мини‑приложении."
   ].join("\n");
 }
 

@@ -80,8 +80,10 @@ test("confirms a Pro purchase with the enabled notification features", () => {
 
 test("describes the Pro-only transport tools in the bot tariff conditions", () => {
   const text = proInfoText("ru");
-  assert.match(text, /построение поездок по адресам с пересадками и картой/);
-  assert.match(text, /умный поиск по остановке/);
+  assert.match(text, /10 ⭐ за 30 дней/);
+  assert.match(text, /Что включено:/);
+  assert.match(text, /Построение поездок: адреса, пересадки и карта/);
+  assert.match(text, /Умный поиск ближайших рейсов по остановке/);
 });
 
 test("keeps outfit advice and the 24-hour plan out of the Free weather payload", () => {
