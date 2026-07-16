@@ -37,6 +37,10 @@ function cleanPaymentChargeId(value) {
   return chargeId.length >= 1 && chargeId.length <= 256 && !/[\r\n\u0000]/.test(chargeId) ? chargeId : null;
 }
 
+function isComplimentaryProChargeId(value) {
+  return /^complimentary-pro-\d{1,20}-v1$/.test(String(value || ""));
+}
+
 function constantTimeEqual(left, right) {
   if (typeof left !== "string" || typeof right !== "string" || !left || !right) return false;
   const encoder = new TextEncoder();
@@ -117,11 +121,13 @@ async function updateSubscription(request, env) {
 function proSubscriptionFromRow(row) {
   const expiresAt = Number(row?.expiresAt);
   const active = Number.isSafeInteger(expiresAt) && expiresAt > epochSeconds();
+  const chargeId = active ? cleanPaymentChargeId(row?.chargeId) : null;
   return {
     active,
     expiresAt: active ? expiresAt : null,
     autoRenewing: active && Number(row?.autoRenewing) === 1,
-    chargeId: active ? cleanPaymentChargeId(row?.chargeId) : null
+    complimentary: active && isComplimentaryProChargeId(chargeId),
+    chargeId
   };
 }
 

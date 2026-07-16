@@ -41,6 +41,11 @@ Telegram username that will answer payment questions. The bot responds to
 `/paysupport` and directs users there. Do not put payment keys or the notification
 shared secret in source control.
 
+For a one-time complimentary 30-day Pro period, set
+`COMPLIMENTARY_PRO_USER_IDS` in Render to a comma-separated list of Telegram
+numeric user IDs. The app sends the recipient a confirmation describing the Pro
+features. Keep real user IDs in platform configuration rather than the repository.
+
 ## Smart transport search
 
 The Mini App shows departures for the next two hours in Grodno time. It switches to the weekend timetable on Saturdays, Sundays, Belarusian statutory non-working holidays (including Radunitsa), and officially transferred days off.

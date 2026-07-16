@@ -20,3 +20,5 @@ services:
         value: true
       - key: PAYMENT_SUPPORT_USERNAME
         value: pitrparkeryouoi
+      - key: COMPLIMENTARY_PRO_USER_IDS
+        sync: false

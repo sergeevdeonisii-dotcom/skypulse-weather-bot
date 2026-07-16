@@ -7,6 +7,7 @@ const {
   parseProInvoicePayload,
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
+  proWelcomeText,
   formatWeatherNotification,
   weatherNotificationSubscriber
 } = require("../bot");
@@ -55,6 +56,21 @@ test("accepts only a valid recurring Pro payment with a Telegram payment charge"
     total_amount: 10,
     subscription_expiration_date: NOW + 30 * 24 * 60 * 60
   }, "123456", NOW, TEST_SECRET), null);
+});
+
+test("confirms a Pro purchase with the enabled notification features", () => {
+  const text = proWelcomeText(NOW + 30 * 24 * 60 * 60);
+  assert.match(text, /Вы приобрели SkyPulse Pro/);
+  assert.match(text, /уведомления о погоде каждые 3 часа/);
+  assert.match(text, /совет по одежде/);
+  assert.match(text, /дожде, сильном ветре и грозе/);
+});
+
+test("labels a complimentary Pro period without an auto-renewal promise", () => {
+  const text = proWelcomeText(NOW + 30 * 24 * 60 * 60, { complimentary: true });
+  assert.match(text, /подключён бесплатно/);
+  assert.match(text, /Stars не списывались/);
+  assert.match(text, /Автопродление для подарочной подписки отключено/);
 });
 
 test("marks Pro notification recipients and adds their extra weather guidance", () => {
