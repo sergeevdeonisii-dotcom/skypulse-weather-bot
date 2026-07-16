@@ -1,17 +1,6 @@
 # SkyPulse Weather Bot
 
-Telegram bot with weather, outfit advice, and Grodno public transport schedules.
-
-## AI psychologist
-
-The Mini App has a **Psychologist** tab for a supportive, non-clinical conversation.
-It uses Gemini through the server-side `GEMINI_API_KEY`; the API key is never sent
-to the Telegram client. The bot does not persist the conversation itself, and the
-page keeps only a short in-memory context while it is open.
-
-It is not an emergency or medical service. Messages that signal an immediate risk
-of self-harm or harm to another person receive a local crisis response rather than
-being forwarded to Gemini.
+Telegram bot with weather and Grodno public transport schedules.
 
 ## Scheduled weather notifications
 
@@ -26,10 +15,12 @@ environment variable. Keep that value in platform secrets only; never commit it.
 
 ## SkyPulse Pro and Telegram Stars
 
-The Weather tab includes a monthly **SkyPulse Pro** subscription. It is billed in
-Telegram Stars and unlocks richer weather updates: an outfit suggestion plus an
-important rain, wind, or thunderstorm warning when appropriate. The price defaults
-to 10 Stars per 30 days and can be changed with `PRO_MONTHLY_PRICE_STARS`.
+The Weather tab includes a monthly **SkyPulse Pro** subscription. Free users get
+current weather, today/tomorrow forecast, and standard three-hour notifications.
+Pro unlocks an outfit suggestion, a 24-hour weather plan with a recommended window
+for a trip or walk, plus important rain, wind, or thunderstorm warnings in the
+notifications. The price defaults to 10 Stars per 30 days and can be changed with
+`PRO_MONTHLY_PRICE_STARS`.
 
 Invoices are created server-side and bound to the Telegram user who opened the Mini
 App. The bot validates every pre-checkout request, then persists the paid access in

@@ -8,6 +8,8 @@ const {
   proCheckoutDetails,
   proSuccessfulPaymentDetails,
   proWelcomeText,
+  miniAppWeatherPayload,
+  miniAppProWeatherDetails,
   formatWeatherNotification,
   weatherNotificationSubscriber
 } = require("../bot");
@@ -61,9 +63,52 @@ test("accepts only a valid recurring Pro payment with a Telegram payment charge"
 test("confirms a Pro purchase with the enabled notification features", () => {
   const text = proWelcomeText(NOW + 30 * 24 * 60 * 60);
   assert.match(text, /Вы приобрели SkyPulse Pro/);
-  assert.match(text, /уведомления о погоде каждые 3 часа/);
+  assert.match(text, /расширенные детали в уведомлениях о погоде каждые 3 часа/);
   assert.match(text, /совет по одежде/);
+  assert.match(text, /план погоды на 24 часа/);
   assert.match(text, /дожде, сильном ветре и грозе/);
+});
+
+test("keeps outfit advice and the 24-hour plan out of the Free weather payload", () => {
+  const hourlyTimes = Array.from({ length: 48 }, (_, index) => (
+    new Date(Date.UTC(2027, 0, 2, index, 0)).toISOString().slice(0, 16)
+  ));
+  const weather = {
+    timezone: "Europe/Minsk",
+    current: {
+      time: "2027-01-02T09:15",
+      temperature_2m: 12,
+      apparent_temperature: 10,
+      weather_code: 2,
+      wind_speed_10m: 11
+    },
+    hourly: {
+      time: hourlyTimes,
+      temperature_2m: hourlyTimes.map((_, index) => 8 + (index % 7)),
+      apparent_temperature: hourlyTimes.map((_, index) => 7 + (index % 7)),
+      precipitation_probability: hourlyTimes.map((_, index) => index === 4 ? 65 : 10),
+      weather_code: hourlyTimes.map(() => 2),
+      wind_speed_10m: hourlyTimes.map(() => 11)
+    },
+    daily: {
+      time: ["2027-01-02", "2027-01-03"],
+      weather_code: [2, 3],
+      temperature_2m_min: [7, 5],
+      temperature_2m_max: [14, 12],
+      precipitation_probability_max: [10, 50]
+    }
+  };
+  const city = { name: "Гродно", timezone: "Europe/Minsk" };
+
+  const free = miniAppWeatherPayload(city, weather);
+  assert.equal(Object.prototype.hasOwnProperty.call(free, "clothing"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(free, "hours"), false);
+
+  const pro = miniAppProWeatherDetails(city, weather);
+  assert.ok(pro.clothing.base);
+  assert.equal(pro.hours.length, 24);
+  assert.equal(pro.hours[0].time, "09:00");
+  assert.match(pro.comfortWindow, /Лучшее окно/);
 });
 
 test("labels a complimentary Pro period without an auto-renewal promise", () => {
